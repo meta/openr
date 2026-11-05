@@ -107,12 +107,24 @@ class DecisionAdjCmd(OpenrCtrlCmd):
         *args,
         **kwargs,
     ) -> None:
-        adj_dbs = await client.getDecisionAdjacenciesFiltered(
-            ctrl_types.AdjacenciesFilter(selectAreas=areas)
-        )
+        adjacency_filter = ctrl_types.AdjacenciesFilter(selectAreas=areas)
+        try:
+            area_adj_dbs = await client.getDecisionAreaAdjacenciesComputed(
+                adjacency_filter, bidir
+            )
+        except ApplicationError as error:
+            if error.type != ApplicationErrorType.UNKNOWN_METHOD:
+                raise
+            adj_dbs = await client.getDecisionAdjacenciesFiltered(adjacency_filter)
+            needs_python_bidir_filter = bidir
+        else:
+            adj_dbs = [db for dbs in area_adj_dbs.values() for db in dbs]
+            needs_python_bidir_filter = False
 
         # convert list<adjDb> from server to a two level map: {area: {node: adjDb}}
-        adjs_map_all_areas = utils.adj_dbs_to_area_dict(adj_dbs, nodes, bidir)
+        adjs_map_all_areas = utils.adj_dbs_to_area_dict(
+            adj_dbs, nodes, needs_python_bidir_filter
+        )
 
         if json_opt:
             utils.print_json(adjs_map_all_areas)

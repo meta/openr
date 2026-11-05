@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from copy import deepcopy
-from typing import Optional
+import json
 from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner, Result
@@ -14,7 +13,13 @@ from later.unittest import TestCase
 from openr.py.openr.cli.clis import decision
 from openr.py.openr.cli.commands.decision import DecisionValidateCmd, PathCmd
 from openr.py.openr.cli.tests import helpers
-from thrift.python.exceptions import ApplicationError, ApplicationErrorType
+from openr.thrift.OpenrCtrl.thrift_types import AdjacenciesFilter, OpenrError
+from thrift.python.exceptions import (
+    ApplicationError,
+    ApplicationErrorType,
+    TransportError,
+    TransportErrorType,
+)
 
 from .fixtures import (
     AREA_SUMMARIES,
@@ -38,6 +43,23 @@ from .fixtures import (
 
 BASE_MODULE: str = decision.__name__
 BASE_CMD_MODULE = "openr.py.openr.cli.commands.decision"
+NEIGHBORS_AREA_1 = "area1"
+NEIGHBORS_AREA_2 = "area2"
+NEIGHBORS_NODE = "abr-node"
+NEIGHBORS_RIGHT_NODE = "openr-right"
+NEIGHBORS_CENTER_NODE = "openr-center"
+NEIGHBORS_FABRIC_ALIAS = "fabric-alias"
+NEIGHBORS_LINK_METRIC_INCREMENT = 37
+NEIGHBORS_RPC_ERROR_MESSAGE = "unknown method"
+NEIGHBORS_JSON_ARGS = ["--json"]
+NEIGHBORS_TEXT_HEADER = (
+    "Neighbor    Local Intf    Remote Intf      Metric  "
+    "NextHop-v4    NextHop-v6    Uptime    Area"
+)
+NEIGHBORS_COMPUTED_MULTI_AREA = {
+    NEIGHBORS_AREA_1: [DECISION_ADJ_DBS_MULTI_AREA[0]],
+    NEIGHBORS_AREA_2: [DECISION_ADJ_DBS_MULTI_AREA[1]],
+}
 
 
 class CliDecisionTests(TestCase):
@@ -53,6 +75,324 @@ class CliDecisionTests(TestCase):
             catch_exceptions=False,
         )
         self.assertEqual(0, invoked_return.exit_code)
+
+    def _mock_neighbors_connection(self, mocked_openr_client: AsyncMock) -> AsyncMock:
+        connection = helpers.get_enter_thrift_asyncmock(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.return_value = (
+            NEIGHBORS_COMPUTED_MULTI_AREA
+        )
+        connection.getDecisionAdjacenciesFiltered.return_value = (
+            DECISION_ADJ_DBS_MULTI_AREA
+        )
+        return connection
+
+    def _invoke_neighbors(self, args: list[str]) -> Result:
+        return self.runner.invoke(
+            decision.DecisionAdjCli.adj,
+            ["--nodes", "all", *args],
+            catch_exceptions=False,
+        )
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_all_areas(self, mocked_openr_client: AsyncMock) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+
+        result = self._invoke_neighbors(NEIGHBORS_JSON_ARGS)
+
+        self.assertEqual(0, result.exit_code)
+        output = json.loads(result.stdout)
+        self.assertEqual({NEIGHBORS_AREA_1, NEIGHBORS_AREA_2}, set(output))
+        self.assertIn(NEIGHBORS_NODE, output[NEIGHBORS_AREA_1])
+        self.assertIn(NEIGHBORS_NODE, output[NEIGHBORS_AREA_2])
+        self.assertEqual(
+            "peer-area1",
+            output[NEIGHBORS_AREA_1][NEIGHBORS_NODE]["adjacencies"][0]["otherNodeName"],
+        )
+        self.assertEqual(
+            "peer-area2",
+            output[NEIGHBORS_AREA_2][NEIGHBORS_NODE]["adjacencies"][0]["otherNodeName"],
+        )
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            AdjacenciesFilter(selectAreas=set()), True
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_forwards_area_filter(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.return_value = {
+            NEIGHBORS_AREA_2: NEIGHBORS_COMPUTED_MULTI_AREA[NEIGHBORS_AREA_2]
+        }
+
+        result = self._invoke_neighbors(
+            [*NEIGHBORS_JSON_ARGS, "--areas", NEIGHBORS_AREA_2]
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual({NEIGHBORS_AREA_2}, set(json.loads(result.stdout)))
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            AdjacenciesFilter(selectAreas={NEIGHBORS_AREA_2}), True
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_retains_node_filter(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.return_value = {
+            NEIGHBORS_AREA_2: [
+                *DECISION_ADJ_DBS_OK,
+                DECISION_ADJ_DBS_MULTI_AREA[1],
+            ]
+        }
+
+        result = self.runner.invoke(
+            decision.DecisionAdjCli.adj,
+            ["--nodes", NEIGHBORS_NODE, *NEIGHBORS_JSON_ARGS],
+            catch_exceptions=False,
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(
+            {NEIGHBORS_NODE}, set(json.loads(result.stdout)[NEIGHBORS_AREA_2])
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_preserves_fabric_alias_and_link_metric_increment(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        right_db, center_db = DECISION_ADJ_DBS_OK
+        right_db = right_db(
+            adjacencies=[
+                right_db.adjacencies[0](
+                    linkMetricIncrementVal=NEIGHBORS_LINK_METRIC_INCREMENT
+                )
+            ]
+        )
+        center_db = center_db(
+            adjacencies=[center_db.adjacencies[0](otherIfName=NEIGHBORS_FABRIC_ALIAS)]
+        )
+        connection.getDecisionAreaAdjacenciesComputed.return_value = {
+            NEIGHBORS_AREA_2: [right_db, center_db]
+        }
+        connection.getDecisionAdjacenciesFiltered.return_value = [right_db, center_db]
+
+        result = self._invoke_neighbors(NEIGHBORS_JSON_ARGS)
+
+        self.assertEqual(0, result.exit_code)
+        output = json.loads(result.stdout)[NEIGHBORS_AREA_2]
+        self.assertEqual({NEIGHBORS_RIGHT_NODE, NEIGHBORS_CENTER_NODE}, set(output))
+        self.assertEqual(
+            NEIGHBORS_LINK_METRIC_INCREMENT,
+            output[NEIGHBORS_RIGHT_NODE]["adjacencies"][0]["linkMetricIncrementVal"],
+        )
+        self.assertEqual(
+            NEIGHBORS_FABRIC_ALIAS,
+            output[NEIGHBORS_CENTER_NODE]["adjacencies"][0]["otherIfName"],
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_preserves_link_metric_increment(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        right_db, center_db = DECISION_ADJ_DBS_OK
+        databases = [
+            right_db(
+                adjacencies=[
+                    right_db.adjacencies[0](
+                        linkMetricIncrementVal=NEIGHBORS_LINK_METRIC_INCREMENT
+                    )
+                ]
+            ),
+            center_db,
+        ]
+        connection.getDecisionAreaAdjacenciesComputed.return_value = {
+            NEIGHBORS_AREA_2: databases
+        }
+        connection.getDecisionAdjacenciesFiltered.return_value = databases
+
+        result = self._invoke_neighbors(NEIGHBORS_JSON_ARGS)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(
+            NEIGHBORS_LINK_METRIC_INCREMENT,
+            json.loads(result.stdout)[NEIGHBORS_AREA_2][NEIGHBORS_RIGHT_NODE][
+                "adjacencies"
+            ][0]["linkMetricIncrementVal"],
+        )
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_computed_text_output(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+
+        result = self._invoke_neighbors([])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(
+            [
+                "",
+                "== Area: area1 ==",
+                "",
+                "> abr-node   ",
+                NEIGHBORS_TEXT_HEADER,
+                "peer-area1  if-area1      peer-if-1             1  "
+                "10.0.0.1      fe80::1                 area1",
+                "",
+                "",
+                "",
+                "== Area: area2 ==",
+                "",
+                "> abr-node   ",
+                NEIGHBORS_TEXT_HEADER,
+                "peer-area2  if-area2      peer-if-2             1  "
+                "10.0.0.2      fe80::2                 area2",
+                "",
+                "",
+            ],
+            result.stdout.splitlines(),
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            AdjacenciesFilter(selectAreas=set()), True
+        )
+        connection.getDecisionAreaAdjacenciesComputed.reset_mock()
+        raw_result = self._invoke_neighbors(["--no-bidir"])
+
+        self.assertEqual(0, raw_result.exit_code)
+        self.assertEqual(result.stdout, raw_result.stdout)
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            AdjacenciesFilter(selectAreas=set()), False
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_no_bidir_uses_raw(self, mocked_openr_client: AsyncMock) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.return_value = {
+            NEIGHBORS_AREA_1: NEIGHBORS_COMPUTED_MULTI_AREA[NEIGHBORS_AREA_1]
+        }
+        connection.getDecisionAdjacenciesFiltered.return_value = (
+            NEIGHBORS_COMPUTED_MULTI_AREA[NEIGHBORS_AREA_1]
+        )
+
+        result = self._invoke_neighbors(
+            [*NEIGHBORS_JSON_ARGS, "--no-bidir", "--areas", NEIGHBORS_AREA_1]
+        )
+
+        self.assertEqual(0, result.exit_code)
+        output = json.loads(result.stdout)
+        self.assertEqual({NEIGHBORS_AREA_1}, set(output))
+        self.assertIn(NEIGHBORS_NODE, output[NEIGHBORS_AREA_1])
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            AdjacenciesFilter(selectAreas={NEIGHBORS_AREA_1}), False
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_unknown_method_falls_back_with_legacy_filter(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.side_effect = ApplicationError(
+            ApplicationErrorType.UNKNOWN_METHOD, NEIGHBORS_RPC_ERROR_MESSAGE
+        )
+        connection.getDecisionAdjacenciesFiltered.return_value = [
+            *DECISION_ADJ_DBS_OK,
+            DECISION_ADJ_DBS_MULTI_AREA[1],
+        ]
+
+        result = self._invoke_neighbors(
+            [*NEIGHBORS_JSON_ARGS, "--areas", NEIGHBORS_AREA_2]
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(
+            {NEIGHBORS_RIGHT_NODE, NEIGHBORS_CENTER_NODE},
+            set(json.loads(result.stdout)[NEIGHBORS_AREA_2]),
+        )
+        expected_filter = AdjacenciesFilter(selectAreas={NEIGHBORS_AREA_2})
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            expected_filter, True
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_awaited_once_with(
+            expected_filter
+        )
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_no_bidir_unknown_method_keeps_raw_adjacencies(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        connection = self._mock_neighbors_connection(mocked_openr_client)
+        connection.getDecisionAreaAdjacenciesComputed.side_effect = ApplicationError(
+            ApplicationErrorType.UNKNOWN_METHOD, NEIGHBORS_RPC_ERROR_MESSAGE
+        )
+        connection.getDecisionAdjacenciesFiltered.return_value = (
+            NEIGHBORS_COMPUTED_MULTI_AREA[NEIGHBORS_AREA_1]
+        )
+
+        result = self._invoke_neighbors(
+            [*NEIGHBORS_JSON_ARGS, "--no-bidir", "--areas", NEIGHBORS_AREA_1]
+        )
+
+        self.assertEqual(0, result.exit_code)
+        output = json.loads(result.stdout)
+        self.assertEqual({NEIGHBORS_AREA_1}, set(output))
+        self.assertEqual({NEIGHBORS_NODE}, set(output[NEIGHBORS_AREA_1]))
+        expected_filter = AdjacenciesFilter(selectAreas={NEIGHBORS_AREA_1})
+        connection.getDecisionAreaAdjacenciesComputed.assert_awaited_once_with(
+            expected_filter, False
+        )
+        connection.getDecisionAdjacenciesFiltered.assert_awaited_once_with(
+            expected_filter
+        )
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_other_application_errors_propagate(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        for error_type in ApplicationErrorType:
+            if error_type == ApplicationErrorType.UNKNOWN_METHOD:
+                continue
+            with self.subTest(error_type=error_type):
+                connection = self._mock_neighbors_connection(mocked_openr_client)
+                error = ApplicationError(error_type, NEIGHBORS_RPC_ERROR_MESSAGE)
+                connection.getDecisionAreaAdjacenciesComputed.side_effect = error
+
+                with self.assertRaises(ApplicationError) as raised:
+                    self._invoke_neighbors(NEIGHBORS_JSON_ARGS)
+
+                self.assertIs(error, raised.exception)
+                connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
+
+    @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
+    def test_neighbors_transport_and_server_errors_propagate(
+        self, mocked_openr_client: AsyncMock
+    ) -> None:
+        for error in (
+            TransportError(
+                TransportErrorType.TIMED_OUT, NEIGHBORS_RPC_ERROR_MESSAGE, 0, 0
+            ),
+            OpenrError(message=NEIGHBORS_RPC_ERROR_MESSAGE),
+        ):
+            with self.subTest(error=error):
+                connection = self._mock_neighbors_connection(mocked_openr_client)
+                connection.getDecisionAreaAdjacenciesComputed.side_effect = error
+
+                with self.assertRaises(type(error)) as raised:
+                    self._invoke_neighbors(NEIGHBORS_JSON_ARGS)
+
+                self.assertIs(error, raised.exception)
+                connection.getDecisionAdjacenciesFiltered.assert_not_awaited()
 
     @patch(helpers.COMMANDS_GET_OPENR_CTRL_CPP_CLIENT)
     def test_decision_validate_all_areas(self, mocked_openr_client: AsyncMock) -> None:
