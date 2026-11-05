@@ -588,7 +588,7 @@ TEST_F(OpenrCtrlFixture, DrainStateApis) {
   ASSERT_FALSE(state->drained_interfaces());
 }
 
-CO_TEST_F(OpenrCtrlFixture, ComputedAdjacenciesForwardAreaFilter) {
+CO_TEST_F(OpenrCtrlFixture, ComputedAdjacenciesForwardAreaFilterAndBidir) {
   constexpr int32_t kMetric{10};
   constexpr int32_t kAdjLabel{0};
   constexpr int32_t kNodeLabel{0};
@@ -673,24 +673,52 @@ CO_TEST_F(OpenrCtrlFixture, ComputedAdjacenciesForwardAreaFilter) {
   filter.selectAreas() = kSpineOnlySet;
   const auto computed =
       co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesComputed(
-          filter);
+          filter, /*p_bidir=*/true);
   CO_ASSERT_EQ(1, computed.size());
   EXPECT_THAT(
       computed.at(kSpineAreaId),
       testing::UnorderedElementsAre(computedLocalDb, peerDb));
   const auto decisionComputed =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed(filter);
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          filter, /*bidir=*/true);
   EXPECT_EQ(*decisionComputed, computed);
+
+  const auto raw =
+      co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesComputed(
+          filter, /*p_bidir=*/false);
+  CO_ASSERT_EQ(1, raw.size());
+  EXPECT_THAT(
+      raw.at(kSpineAreaId), testing::UnorderedElementsAre(rawLocalDb, peerDb));
+  const auto decisionRaw =
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          filter, /*bidir=*/false);
+  EXPECT_EQ(*decisionRaw, raw);
+  const auto filteredRaw =
+      co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesFiltered(
+          filter);
+  EXPECT_EQ(filteredRaw, raw);
 
   const auto allComputed =
       co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesComputed(
-          allAreas);
+          allAreas, /*p_bidir=*/true);
   EXPECT_EQ(2, allComputed.size());
-  filter.selectAreas() = {"unknown-area"};
-  const auto unknown =
+  const auto allRaw =
       co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesComputed(
-          filter);
-  EXPECT_TRUE(unknown.empty());
+          allAreas, /*p_bidir=*/false);
+  CO_ASSERT_EQ(2, allRaw.size());
+  EXPECT_THAT(
+      allRaw.at(kSpineAreaId),
+      testing::UnorderedElementsAre(rawLocalDb, peerDb));
+  EXPECT_THAT(
+      allRaw.at(kPlaneAreaId),
+      testing::UnorderedElementsAre(planeLocalDb, planePeerDb));
+  filter.selectAreas() = {"unknown-area"};
+  for (const bool bidir : {true, false}) {
+    const auto unknown =
+        co_await getOpenrCtrlClient().co_getDecisionAreaAdjacenciesComputed(
+            filter, bidir);
+    EXPECT_TRUE(unknown.empty());
+  }
 }
 
 TEST_F(OpenrCtrlFixture, DecisionApis) {

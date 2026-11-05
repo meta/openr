@@ -547,12 +547,15 @@ service OpenrCtrl extends KvStore.KvStoreService {
 
   /**
    * Get area adjacency databases projected from Decision's computed links.
+   * With bidir=false, return raw advertisements, including partial and
+   * one-sided adjacencies, instead of the computed projection.
    * Empty selectAreas selects all areas; unknown areas have no entry.
    * Adjacency overload includes both link ends. Node overload and advertised
-   * adjacency fields are preserved.
+   * adjacency fields are preserved when bidir=true.
    */
   map<string, list<Types.AdjacencyDatabase>> getDecisionAreaAdjacenciesComputed(
     1: AdjacenciesFilter filter,
+    2: bool bidir,
   ) throws (1: OpenrError error);
 
   /**

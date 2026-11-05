@@ -266,7 +266,7 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   folly::coro::Task<std::unique_ptr<
       std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>>
   co_getDecisionAreaAdjacenciesComputed(
-      std::unique_ptr<thrift::AdjacenciesFilter> filter) override;
+      std::unique_ptr<thrift::AdjacenciesFilter> filter, bool bidir) override;
 
   folly::SemiFuture<std::unique_ptr<thrift::RouteDatabase>>
   semifuture_getRouteDbComputed(std::unique_ptr<std::string> nodeName) override;

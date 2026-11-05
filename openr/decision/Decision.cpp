@@ -480,21 +480,31 @@ Decision::getDecisionAreaAdjacenciesFiltered(thrift::AdjacenciesFilter filter) {
 folly::coro::Task<std::unique_ptr<
     std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>>
 Decision::co_getDecisionAreaAdjacenciesComputed(
-    thrift::AdjacenciesFilter filter) {
+    thrift::AdjacenciesFilter filter, bool bidir) {
   co_return co_await co_withExecutor(
-      getEvb(), co_getDecisionAreaAdjacenciesComputedImpl(std::move(filter)));
+      getEvb(),
+      co_getDecisionAreaAdjacenciesComputedImpl(std::move(filter), bidir));
 }
 
 folly::coro::Task<std::unique_ptr<
     std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>>
 Decision::co_getDecisionAreaAdjacenciesComputedImpl(
-    thrift::AdjacenciesFilter filter) {
+    thrift::AdjacenciesFilter filter, bool bidir) {
   auto res = std::make_unique<
       std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>();
   const auto& selectAreas = filter.selectAreas().ensure();
   for (auto const& [area, linkState] : areaLinkStates_) {
     if (selectAreas.empty() || selectAreas.count(area)) {
-      auto databases = linkState.getAdjacencyDatabasesComputed();
+      std::vector<thrift::AdjacencyDatabase> databases;
+      if (bidir) {
+        databases = linkState.getAdjacencyDatabasesComputed();
+      } else {
+        const auto& rawDatabases = linkState.getAdjacencyDatabases();
+        databases.reserve(rawDatabases.size());
+        for (const auto& [_, db] : rawDatabases) {
+          databases.push_back(db);
+        }
+      }
       if (!databases.empty()) {
         res->emplace(area, std::move(databases));
       }

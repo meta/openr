@@ -489,14 +489,17 @@ class DecisionComputedAdjacenciesTestFixture : public DecisionTestFixture {
 };
 
 CO_TEST_F(DecisionTestFixture, ComputedAdjacenciesEmptyState) {
-  const auto computed =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed();
-  EXPECT_TRUE(computed->empty());
+  for (const bool bidir : {true, false}) {
+    const auto databases =
+        co_await decision->co_getDecisionAreaAdjacenciesComputed({}, bidir);
+    EXPECT_TRUE(databases->empty());
+  }
 }
 
 CO_TEST_F(DecisionComputedAdjacenciesTestFixture, ComputedAdjacenciesAllAreas) {
   const auto computed =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed();
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          {}, /*bidir=*/true);
   CO_ASSERT_EQ(2, computed->size());
   EXPECT_THAT(
       computed->at(kTestingAreaName),
@@ -508,7 +511,8 @@ CO_TEST_F(DecisionComputedAdjacenciesTestFixture, ComputedAdjacenciesAllAreas) {
   thrift::AdjacenciesFilter emptyFilter;
   emptyFilter.selectAreas() = {};
   const auto explicitlyEmpty =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed(emptyFilter);
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          emptyFilter, /*bidir=*/true);
   EXPECT_EQ(*computed, *explicitlyEmpty);
 
   /**
@@ -526,12 +530,62 @@ CO_TEST_F(DecisionComputedAdjacenciesTestFixture, ComputedAdjacenciesAllAreas) {
           rawLocalDb_, peerDb_, otherAreaLocalDb_, otherAreaPeerDb_));
 }
 
+CO_TEST_F(DecisionComputedAdjacenciesTestFixture, RawAdjacenciesAllAreas) {
+  const auto databases =
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          {}, /*bidir=*/false);
+  CO_ASSERT_EQ(2, databases->size());
+  EXPECT_THAT(
+      databases->at(kTestingAreaName),
+      UnorderedElementsAre(rawLocalDb_, peerDb_));
+  EXPECT_THAT(
+      databases->at(kOtherArea),
+      UnorderedElementsAre(otherAreaLocalDb_, otherAreaPeerDb_));
+
+  const auto raw = co_await folly::coro::toTask(
+      decision->getDecisionAreaAdjacenciesFiltered());
+  EXPECT_EQ(*raw, *databases);
+  const auto legacyRaw =
+      co_await folly::coro::toTask(decision->getDecisionAdjacenciesFiltered());
+  EXPECT_THAT(
+      *legacyRaw,
+      UnorderedElementsAre(
+          rawLocalDb_, peerDb_, otherAreaLocalDb_, otherAreaPeerDb_));
+
+  thrift::AdjacenciesFilter emptyFilter;
+  emptyFilter.selectAreas() = {};
+  const auto explicitlyEmpty =
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          emptyFilter, /*bidir=*/false);
+  EXPECT_EQ(*databases, *explicitlyEmpty);
+}
+
+CO_TEST_F(DecisionComputedAdjacenciesTestFixture, RawAdjacenciesSelectedArea) {
+  thrift::AdjacenciesFilter filter;
+  filter.selectAreas() = {kTestingAreaName};
+  const auto databases =
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          filter, /*bidir=*/false);
+  CO_ASSERT_EQ(1, databases->size());
+  EXPECT_THAT(
+      databases->at(kTestingAreaName),
+      UnorderedElementsAre(rawLocalDb_, peerDb_));
+
+  const auto raw = co_await folly::coro::toTask(
+      decision->getDecisionAreaAdjacenciesFiltered(filter));
+  EXPECT_EQ(*raw, *databases);
+  const auto legacyRaw = co_await folly::coro::toTask(
+      decision->getDecisionAdjacenciesFiltered(filter));
+  EXPECT_THAT(*legacyRaw, UnorderedElementsAre(rawLocalDb_, peerDb_));
+}
+
 CO_TEST_F(
     DecisionComputedAdjacenciesTestFixture, ComputedAdjacenciesSelectedArea) {
   thrift::AdjacenciesFilter filter;
   filter.selectAreas() = {kOtherArea};
   const auto computed =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed(filter);
+      co_await decision->co_getDecisionAreaAdjacenciesComputed(
+          filter, /*bidir=*/true);
   CO_ASSERT_EQ(1, computed->size());
   EXPECT_THAT(
       computed->at(kOtherArea),
@@ -542,9 +596,11 @@ CO_TEST_F(
     DecisionComputedAdjacenciesTestFixture, ComputedAdjacenciesUnknownArea) {
   thrift::AdjacenciesFilter filter;
   filter.selectAreas() = {"unknown-area"};
-  const auto computed =
-      co_await decision->co_getDecisionAreaAdjacenciesComputed(filter);
-  EXPECT_TRUE(computed->empty());
+  for (const bool bidir : {true, false}) {
+    const auto databases =
+        co_await decision->co_getDecisionAreaAdjacenciesComputed(filter, bidir);
+    EXPECT_TRUE(databases->empty());
+  }
 }
 
 TEST_F(DecisionTestFixture, DecisionUndrainStateTest) {

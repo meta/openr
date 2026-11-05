@@ -188,11 +188,14 @@ class Decision : public OpenrEventBase {
 
   /**
    * Retrieve area adjacency databases projected from computed links.
+   * With bidir=false, return raw advertisements, including partial and
+   * one-sided adjacencies, instead of the computed projection.
    * Empty selectAreas selects all areas; unknown areas have no entry.
    */
   folly::coro::Task<std::unique_ptr<
       std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>>
-  co_getDecisionAreaAdjacenciesComputed(thrift::AdjacenciesFilter filter = {});
+  co_getDecisionAreaAdjacenciesComputed(
+      thrift::AdjacenciesFilter filter, bool bidir);
 
   /*
    * Retrieve received routes along with best route selection output.
@@ -234,7 +237,8 @@ class Decision : public OpenrEventBase {
 
   folly::coro::Task<std::unique_ptr<
       std::map<std::string, std::vector<thrift::AdjacencyDatabase>>>>
-  co_getDecisionAreaAdjacenciesComputedImpl(thrift::AdjacenciesFilter filter);
+  co_getDecisionAreaAdjacenciesComputedImpl(
+      thrift::AdjacenciesFilter filter, bool bidir);
 
   Decision(Decision const&) = delete;
   Decision& operator=(Decision const&) = delete;
