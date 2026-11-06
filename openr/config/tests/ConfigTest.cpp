@@ -726,6 +726,18 @@ TEST(ConfigTest, QueueCoalescingKnob) {
   EXPECT_FALSE(Config(tConfigKnob).isQueueCoalescingEnabled());
 }
 
+TEST(ConfigTest, CtrlThriftServerLimitsKnob) {
+  auto tConfig = getBasicOpenrConfig();
+  EXPECT_FALSE(tConfig.enable_ctrl_thrift_server_limits().has_value());
+  EXPECT_FALSE(Config(tConfig).isCtrlThriftServerLimitsEnabled());
+
+  tConfig.enable_ctrl_thrift_server_limits() = true;
+  EXPECT_TRUE(Config(tConfig).isCtrlThriftServerLimitsEnabled());
+
+  tConfig.enable_ctrl_thrift_server_limits() = false;
+  EXPECT_FALSE(Config(tConfig).isCtrlThriftServerLimitsEnabled());
+}
+
 TEST(ConfigTest, HealthValidatorKnob) {
   auto tConfig = getBasicOpenrConfig();
   auto config = Config(tConfig);

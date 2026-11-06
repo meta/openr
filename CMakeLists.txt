@@ -841,6 +841,18 @@ if(BUILD_TESTS)
     DESTINATION sbin/tests/openr/common
   )
 
+  add_openr_test(MainUtilTest main_util_test
+    SOURCES
+      openr/common/tests/MainUtilTest.cpp
+    LIBRARIES
+      openr_main_util
+      Folly::folly
+      FBThrift::thriftcpp2
+      glog::glog
+      gflags
+    DESTINATION sbin/tests/openr/common
+  )
+
   add_openr_test(UtilTest util_test
     SOURCES
       openr/common/tests/UtilTest.cpp

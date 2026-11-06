@@ -375,6 +375,40 @@ class Constants {
   static constexpr std::chrono::milliseconds kThriftServerQueueTimeout{1000};
 
   /*
+   * Limits on the OpenrCtrl Thrift server (openr_ctrl_port), applied when
+   * enable_ctrl_thrift_server_limits is set. Sized from 7 days of per-minute
+   * (.60) EB counters, 2026-10-29 to 2026-11-05. See T294995552.
+   *
+   * Connections: at most 30 on any host in any minute.
+   */
+  static constexpr uint32_t kOpenrCtrlThriftMaxConnections{256};
+  /*
+   * In-flight requests (active_requests.p100.60): fleet p99.9 minute 122,
+   * busiest host p99.9 minute 286; above 1024 in 3 single minutes over the
+   * week.
+   */
+  static constexpr uint32_t kOpenrCtrlThriftMaxRequests{1024};
+  /*
+   * Closes a connection whose client has read none of the pending response
+   * bytes for this long. Slow but progressing writes are not affected.
+   */
+  static constexpr std::chrono::milliseconds kOpenrCtrlThriftSocketWriteTimeout{
+      std::chrono::seconds(15)};
+  /*
+   * Responses queued for delivery. The server has one IO worker, so all
+   * connections share this budget; the connection whose write crosses it is
+   * closed and its pending responses discarded.
+   */
+  static constexpr size_t kOpenrCtrlThriftEgressMemoryLimitBytes{
+      128 * 1024 * 1024};
+  /*
+   * Per connection: pending stream writes above which the connection's stream
+   * generators (KvStore/Fib subscriptions) are paused until it drains.
+   */
+  static constexpr size_t kOpenrCtrlThriftEgressBackpressureThresholdBytes{
+      8 * 1024 * 1024};
+
+  /*
    *
    * See https://github.com/facebook/openr/blob/master/openr/docs/Versions.md
    * for details of version history

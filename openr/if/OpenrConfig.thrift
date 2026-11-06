@@ -816,4 +816,18 @@ struct OpenrConfig {
    * false both preserve the disabled rollout default.
    */
   205: optional bool enable_health_validator;
+
+  /**
+   * Bound the OpenrCtrl Thrift server on openr_ctrl_port (2018): cap
+   * connections, in-flight requests and buffered egress bytes, and set a
+   * socket-write timeout. Applies to both the default-VRF and the
+   * non-default-VRF server; never to the KvStore peer server on
+   * kvstore_peer_port.
+   *
+   * Optional (no thrift default) so it is not serialized into every generated
+   * openr config; the effective default (false) is applied in
+   * Config::isCtrlThriftServerLimitsEnabled via value_or(false). Set this true
+   * for per-scope (configerator) rollout, and unset/false to roll back.
+   */
+  206: optional bool enable_ctrl_thrift_server_limits;
 }

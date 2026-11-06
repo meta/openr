@@ -96,6 +96,13 @@ void configureKvStorePeerThriftServerMemoryLimits(
     std::shared_ptr<OpenrIngressKvStoreBackpressure>
         openrIngressKvStoreBackpressure);
 
+/**
+ * Bound the OpenrCtrl server on port 2018: cap connections, in-flight requests
+ * and queued egress bytes, and close stalled connections. Call before serve().
+ * Do not apply to the KvStore peer server.
+ */
+void configureCtrlThriftServerLimits(apache::thrift::ThriftServer& server);
+
 void waitTillStart(std::shared_ptr<apache::thrift::ThriftServer> server);
 
 } // namespace openr

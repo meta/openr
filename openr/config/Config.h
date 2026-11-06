@@ -197,6 +197,16 @@ class Config {
     return config_.enable_openr_queue_coalescing().value_or(false);
   }
 
+  /*
+   * Connection, request, egress and write-timeout limits on the OpenrCtrl
+   * Thrift server. Disabled by default so they can be rolled out per-scope via
+   * configerator.
+   */
+  bool
+  isCtrlThriftServerLimitsEnabled() const {
+    return config_.enable_ctrl_thrift_server_limits().value_or(false);
+  }
+
   /**
    * Open/R health validation is disabled until a scope explicitly opts in.
    */

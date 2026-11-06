@@ -148,6 +148,20 @@ configureKvStorePeerThriftServerMemoryLimits(
 }
 
 void
+configureCtrlThriftServerLimits(apache::thrift::ThriftServer& server) {
+  static_assert(
+      Constants::kOpenrCtrlThriftEgressBackpressureThresholdBytes <
+      Constants::kOpenrCtrlThriftEgressMemoryLimitBytes);
+  server.setMaxConnections(Constants::kOpenrCtrlThriftMaxConnections);
+  server.setMaxRequests(Constants::kOpenrCtrlThriftMaxRequests);
+  server.setSocketWriteTimeout(Constants::kOpenrCtrlThriftSocketWriteTimeout);
+  server.setEgressMemoryLimit(
+      Constants::kOpenrCtrlThriftEgressMemoryLimitBytes);
+  server.setEgressBufferBackpressureThreshold(
+      Constants::kOpenrCtrlThriftEgressBackpressureThresholdBytes);
+}
+
+void
 waitTillStart(std::shared_ptr<apache::thrift::ThriftServer> server) {
   while (true) {
     auto evb = server->getServeEventBase();

@@ -611,6 +611,9 @@ main(int argc, char** argv) {
 
   // Start the thrift server
   auto server = setUpThriftServer(config, ctrlHandler, sslContext);
+  if (config->isCtrlThriftServerLimitsEnabled()) {
+    configureCtrlThriftServerLimits(*server);
+  }
   std::thread serverThread = std::thread([&]() {
     XLOG(INFO, "Starting ThriftCtrlServer thread ...");
     folly::setThreadName("openr-ThriftCtrlServer");
