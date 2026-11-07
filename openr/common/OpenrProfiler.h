@@ -174,14 +174,14 @@ class ScopedProfile {
  public:
   explicit inline ScopedProfile(const char* name) noexcept : name_(name) {
     auto* profiler = OpenrProfiler::getInstance();
-    if (FOLLY_LIKELY(!profiler->isEnabled())) {
+    if (!profiler->isEnabled()) [[likely]] {
       return;
     }
     recordStart(profiler);
   }
 
   inline ~ScopedProfile() noexcept {
-    if (FOLLY_UNLIKELY(shouldRecord_)) {
+    if (shouldRecord_) [[unlikely]] {
       recordEnd();
     }
   }
