@@ -10,10 +10,12 @@
 
 #include <fb303/ServiceData.h>
 #include <folly/container/F14Map.h>
+#include <folly/coro/CurrentExecutor.h>
 #include <folly/coro/FutureUtil.h>
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/Timeout.h>
 #include <folly/init/Init.h>
+#include <folly/synchronization/Baton.h>
 #include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include <openr/common/Constants.h>
@@ -389,6 +391,9 @@ CO_TEST(OpenrCtrlHandlerTest, KvStoreApisWithoutKvStore) {
   CO_ASSERT_THROW(
       co_await client->co_getKvStorePeersArea(kSpineAreaId),
       thrift::KvStoreError);
+  CO_ASSERT_THROW(
+      co_await client->co_subscribeAndGetAreaKvStores(filter, kSpineOnlySet),
+      apache::thrift::TApplicationException);
 }
 
 CO_TEST_F(OpenrCtrlFixture, GetKvStorePeersRequiresSingleArea) {
@@ -1255,11 +1260,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     const std::string key{"snoop-key"};
     std::atomic<int> received{0}, diff{0};
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
     /*
      * Expect 10 keys in the initial dump
      * NOTE: there may be extra keys from PrefixManager & LinkMonitor)
@@ -1361,18 +1363,12 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
 
     auto handler_other = handler_;
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     auto responseAndSubscription_other =
-        handler_other
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_other->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     /* key4 and random_key don't exist already */
     EXPECT_LE(0, (*responseAndSubscription.response.begin()->keyVals()).size());
@@ -1467,11 +1463,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     filter.oper() = thrift::FilterOperator::AND;
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     /* prefix key is key33. kv store has key33 and key333 */
     EXPECT_LE(2, responseAndSubscription.response.begin()->keyVals()->size());
@@ -1544,11 +1537,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     keyvals["key333"] = "value333";
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     EXPECT_LE(2, (*responseAndSubscription.response.begin()->keyVals()).size());
     CO_ASSERT_EQ(
@@ -1626,11 +1616,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     filter.oper() = thrift::FilterOperator::AND;
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     EXPECT_LE(3, (*responseAndSubscription.response.begin()->keyVals()).size());
     EXPECT_EQ(
@@ -1719,11 +1706,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     keyvals["random-prefix"] = "value1";
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     EXPECT_LE(3, (*responseAndSubscription.response.begin()->keyVals()).size());
     EXPECT_EQ(
@@ -1809,11 +1793,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     filter.oper() = thrift::FilterOperator::AND;
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     /* The key is not in kv store */
     EXPECT_LE(0, (*responseAndSubscription.response.begin()->keyVals()).size());
@@ -1874,11 +1855,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     keyvals["random-prefix-2"] = "value1";
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(
+            thrift::KeyDumpParams(), kSpineOnlySet);
 
     EXPECT_LE(0, (*responseAndSubscription.response.begin()->keyVals()).size());
 
@@ -1993,11 +1971,7 @@ CO_TEST_F(
     kvStoreWrapper_->setKey(kSpineAreaId, "key1", thriftValue);
 
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(filter),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(filter, kSpineOnlySet);
 
     EXPECT_LE(3, (*responseAndSubscription.response.begin()->keyVals()).size());
     for (const auto& key_ : {"key1", "key11", "key111"}) {
@@ -2095,11 +2069,7 @@ CO_TEST_F(
     thriftValue.value().reset();
     kvStoreWrapper_->setKey(kSpineAreaId, "key3", thriftValue);
     auto responseAndSubscription =
-        handler_
-            ->semifuture_subscribeAndGetAreaKvStores(
-                std::make_unique<thrift::KeyDumpParams>(filter),
-                std::make_unique<std::set<std::string>>(kSpineOnlySet))
-            .get();
+        co_await handler_->co_subscribeAndDumpKvStore(filter, kSpineOnlySet);
 
     EXPECT_LE(3, (*responseAndSubscription.response.begin()->keyVals()).size());
     for (const auto& key_ : {"key3", "key33", "key333"}) {
@@ -2201,11 +2171,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithoutValue) {
   filter.doNotPublishValue() = true;
 
   auto responseAndSubscription =
-      handler_
-          ->semifuture_subscribeAndGetAreaKvStores(
-              std::make_unique<thrift::KeyDumpParams>(filter),
-              std::make_unique<std::set<std::string>>(kSpineOnlySet))
-          .get();
+      co_await handler_->co_subscribeAndDumpKvStore(filter, kSpineOnlySet);
 
   auto initialPub = responseAndSubscription.response.begin();
   EXPECT_EQ(2, (*initialPub->keyVals()).size());
@@ -2745,6 +2711,75 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStore) {
     auto pubVal = *pub;
     checkPublications(expectedDeltas[verifiedIdx], pubVal);
   }
+}
+
+/*
+ * A key update published after subscriber registration and before the
+ * KvStore dump arrives on the stream. The snapshot does not carry it.
+ */
+CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
+  const std::string key{"race-key"};
+  const auto value = createThriftValue(1, "node1", std::string("value1"));
+  thrift::KeyDumpParams filter;
+  filter.keys() = {key};
+
+  /*
+   * Hold the KvStore event base: the dump queues behind it. The injected
+   * publication enters the KvStore updates queue directly.
+   */
+  folly::Baton<> kvStoreEvbHeld;
+  folly::Baton<> releaseKvStoreEvb;
+  kvStoreWrapper_->getKvStore()->runInEventBaseThread([&]() {
+    kvStoreEvbHeld.post();
+    releaseKvStoreEvb.wait();
+  });
+  kvStoreEvbHeld.wait();
+
+  /*
+   * The inline start returns at the first suspension point, the dump on the
+   * held event base. Registration precedes it.
+   */
+  auto* executor = co_await folly::coro::co_current_executor;
+  auto responseFuture =
+      co_withExecutor(
+          folly::getKeepAliveToken(executor),
+          handler_->co_subscribeAndDumpKvStore(filter, kSpineOnlySet))
+          .startInlineUnsafe();
+  const auto numSubscribersBeforeDump = handler_->getNumKvStorePublishers();
+  kvStoreWrapper_->pushToKvStoreUpdatesQueue(kSpineAreaId, {{key, value}});
+  releaseKvStoreEvb.post();
+  CO_ASSERT_EQ(1, numSubscribersBeforeDump);
+
+  auto responseAndStream =
+      co_await folly::coro::toTask(std::move(responseFuture));
+  CO_ASSERT_EQ(1, responseAndStream.response.size());
+  EXPECT_EQ(0, responseAndStream.response.front().keyVals()->count(key));
+
+  auto gen = std::move(responseAndStream.stream)
+                 .toClientStreamUnsafeDoNotUse()
+                 .toAsyncGenerator();
+  auto pub =
+      co_await folly::coro::timeout(gen.next(), kKvStorePublicationTimeout);
+  CO_ASSERT_TRUE(pub.has_value());
+  auto update = *pub;
+  CO_ASSERT_EQ(1, update.keyVals()->count(key));
+  EXPECT_EQ(value, update.keyVals()->at(key));
+}
+
+/*
+ * The single-area subscribe RPCs fail on a node with three areas and leave
+ * no subscriber behind.
+ */
+CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreRequiresSingleArea) {
+  const thrift::KeyDumpParams filter;
+  CO_ASSERT_THROW(
+      co_await getOpenrCtrlClient().co_subscribeAndGetKvStoreFiltered(filter),
+      apache::thrift::TApplicationException);
+  CO_ASSERT_THROW(
+      co_await getOpenrCtrlClient().co_subscribeAndGetKvStore(),
+      apache::thrift::TApplicationException);
+
+  EXPECT_EQ(0, handler_->getNumKvStorePublishers());
 }
 
 int

@@ -455,21 +455,31 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   apache::thrift::ServerStream<thrift::RouteDatabaseDeltaDetail>
   subscribeFibDetail();
 
-  folly::SemiFuture<apache::thrift::ResponseAndServerStream<
-      thrift::Publication,
-      thrift::Publication>>
-  semifuture_subscribeAndGetKvStore() override;
-
-  folly::SemiFuture<apache::thrift::ResponseAndServerStream<
-      thrift::Publication,
-      thrift::Publication>>
-  semifuture_subscribeAndGetKvStoreFiltered(
-      std::unique_ptr<thrift::KeyDumpParams> filter) override;
-
-  folly::SemiFuture<apache::thrift::ResponseAndServerStream<
+  /*
+   * Registers the subscriber, then dumps the KvStore. A key update that
+   * KvStore publishes after the dump arrives on the stream.
+   */
+  folly::coro::Task<apache::thrift::ResponseAndServerStream<
       std::vector<thrift::Publication>,
       thrift::Publication>>
-  semifuture_subscribeAndGetAreaKvStores(
+  co_subscribeAndDumpKvStore(
+      thrift::KeyDumpParams filter, std::set<std::string> selectAreas);
+
+  folly::coro::Task<apache::thrift::ResponseAndServerStream<
+      thrift::Publication,
+      thrift::Publication>>
+  co_subscribeAndGetKvStore() override;
+
+  folly::coro::Task<apache::thrift::ResponseAndServerStream<
+      thrift::Publication,
+      thrift::Publication>>
+  co_subscribeAndGetKvStoreFiltered(
+      std::unique_ptr<thrift::KeyDumpParams> filter) override;
+
+  folly::coro::Task<apache::thrift::ResponseAndServerStream<
+      std::vector<thrift::Publication>,
+      thrift::Publication>>
+  co_subscribeAndGetAreaKvStores(
       std::unique_ptr<thrift::KeyDumpParams> filter,
       std::unique_ptr<std::set<std::string>> selectAreas) override;
 
@@ -647,6 +657,15 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
 
   folly::coro::Task<std::unique_ptr<thrift::PeersMap>> co_getKvStorePeersImpl(
       std::string area);
+
+  /*
+   * Subscribes in the node's only area and returns one snapshot Publication.
+   * Throws OpenrError when the node has more than one area.
+   */
+  folly::coro::Task<apache::thrift::ResponseAndServerStream<
+      thrift::Publication,
+      thrift::Publication>>
+  co_subscribeAndDumpKvStoreHelper(thrift::KeyDumpParams filter);
 
   void processPublication(thrift::Publication&& pub);
   void authorizeConnection();

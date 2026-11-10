@@ -1266,59 +1266,67 @@ OpenrCtrlHandler::subscribeKvStoreFilter(
   return std::move(streamAndPublisher.first);
 }
 
-folly::SemiFuture<apache::thrift::ResponseAndServerStream<
+folly::coro::Task<apache::thrift::ResponseAndServerStream<
     thrift::Publication,
     thrift::Publication>>
-OpenrCtrlHandler::semifuture_subscribeAndGetKvStore() {
-  return semifuture_subscribeAndGetKvStoreFiltered(
-      std::make_unique<thrift::KeyDumpParams>());
+OpenrCtrlHandler::co_subscribeAndGetKvStore() {
+  co_return co_await co_subscribeAndDumpKvStoreHelper(thrift::KeyDumpParams());
 }
 
-folly::SemiFuture<apache::thrift::ResponseAndServerStream<
+folly::coro::Task<apache::thrift::ResponseAndServerStream<
     thrift::Publication,
     thrift::Publication>>
-OpenrCtrlHandler::semifuture_subscribeAndGetKvStoreFiltered(
-    std::unique_ptr<thrift::KeyDumpParams> dumpParams) {
-  auto selectAreas = std::make_unique<std::set<std::string>>();
-  selectAreas->insert(*getSingleAreaOrThrow());
-  return semifuture_subscribeAndGetAreaKvStores(
-             std::move(dumpParams), std::move(selectAreas))
-      .deferValue([](apache::thrift::ResponseAndServerStream<
-                      std::vector<thrift::Publication>,
-                      thrift::Publication>&& responses) mutable {
-        thrift::Publication pub = responses.response.empty()
-            ? thrift::Publication{}
-            : std::move(*responses.response.begin());
-        return apache::thrift::
-            ResponseAndServerStream<thrift::Publication, thrift::Publication>{
-                std::move(pub), std::move(responses.stream)};
-      });
+OpenrCtrlHandler::co_subscribeAndGetKvStoreFiltered(
+    std::unique_ptr<thrift::KeyDumpParams> filter) {
+  co_return co_await co_subscribeAndDumpKvStoreHelper(std::move(*filter));
 }
 
-folly::SemiFuture<apache::thrift::ResponseAndServerStream<
+folly::coro::Task<apache::thrift::ResponseAndServerStream<
     std::vector<thrift::Publication>,
     thrift::Publication>>
-OpenrCtrlHandler::semifuture_subscribeAndGetAreaKvStores(
-    std::unique_ptr<thrift::KeyDumpParams> dumpParams,
+OpenrCtrlHandler::co_subscribeAndGetAreaKvStores(
+    std::unique_ptr<thrift::KeyDumpParams> filter,
     std::unique_ptr<std::set<std::string>> selectAreas) {
-  auto dumpParamsCopy = std::make_unique<thrift::KeyDumpParams>(*dumpParams);
-  auto selectAreasCopy = std::make_unique<std::set<std::string>>(*selectAreas);
-  return kvStore_
-      ->semifuture_dumpKvStoreKeys(
-          std::move(*dumpParams), std::move(*selectAreas))
-      .defer([stream = subscribeKvStoreFilter(
-                  std::move(dumpParamsCopy), std::move(selectAreasCopy))](
-                 folly::Try<std::unique_ptr<std::vector<thrift::Publication>>>&&
-                     pubs) mutable {
-        pubs.throwUnlessValue();
-        for (auto& pub : *pubs.value()) {
-          // Set the publication timestamp
-          pub.timestamp_ms() = getUnixTimeStampMs();
-        }
-        return apache::thrift::ResponseAndServerStream<
-            std::vector<thrift::Publication>,
-            thrift::Publication>{std::move(*pubs.value()), std::move(stream)};
-      });
+  co_return co_await co_subscribeAndDumpKvStore(
+      std::move(*filter), std::move(*selectAreas));
+}
+
+folly::coro::Task<apache::thrift::ResponseAndServerStream<
+    thrift::Publication,
+    thrift::Publication>>
+OpenrCtrlHandler::co_subscribeAndDumpKvStoreHelper(
+    thrift::KeyDumpParams filter) {
+  std::set<std::string> selectAreas{*getSingleAreaOrThrow()};
+  auto responseAndStream = co_await co_subscribeAndDumpKvStore(
+      std::move(filter), std::move(selectAreas));
+  auto pub = responseAndStream.response.empty()
+      ? thrift::Publication{}
+      : std::move(responseAndStream.response.front());
+  co_return apache::thrift::
+      ResponseAndServerStream<thrift::Publication, thrift::Publication>{
+          std::move(pub), std::move(responseAndStream.stream)};
+}
+
+folly::coro::Task<apache::thrift::ResponseAndServerStream<
+    std::vector<thrift::Publication>,
+    thrift::Publication>>
+OpenrCtrlHandler::co_subscribeAndDumpKvStore(
+    thrift::KeyDumpParams filter, std::set<std::string> selectAreas) {
+  if (!kvStore_) {
+    throw thrift::KvStoreError(kKvStoreNotInitializedError);
+  }
+
+  auto stream = subscribeKvStoreFilter(
+      std::make_unique<thrift::KeyDumpParams>(filter),
+      std::make_unique<std::set<std::string>>(selectAreas));
+  auto pubs = co_await kvStore_->co_dumpKvStoreKeys(
+      std::move(filter), std::move(selectAreas));
+  for (auto& pub : *pubs) {
+    pub.timestamp_ms() = getUnixTimeStampMs();
+  }
+  co_return apache::thrift::ResponseAndServerStream<
+      std::vector<thrift::Publication>,
+      thrift::Publication>{std::move(*pubs), std::move(stream)};
 }
 
 apache::thrift::ServerStream<thrift::RouteDatabaseDelta>
