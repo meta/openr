@@ -387,13 +387,14 @@ class FibTestFixture : public ::testing::Test {
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [&received](auto&& t) {
-              if (!t.hasValue()) {
-                return;
-              }
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [&received](auto&& t) {
+                  if (!t.hasValue()) {
+                    return;
+                  }
 
-              received++;
-            });
+                  received++;
+                });
 
     EXPECT_EQ(1, handler_->getNumFibPublishers());
 
@@ -426,13 +427,14 @@ class FibTestFixture : public ::testing::Test {
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [&received](auto&& t) {
-              if (!t.hasValue()) {
-                return;
-              }
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [&received](auto&& t) {
+                  if (!t.hasValue()) {
+                    return;
+                  }
 
-              received++;
-            });
+                  received++;
+                });
 
     EXPECT_EQ(1, handler_->getNumFibDetailSubscribers());
 
@@ -660,7 +662,7 @@ TEST_F(FibTestFixture, fibStreamingSingleSubscriber) {
       std::move(responseAndSubscription.stream)
           .toClientStreamUnsafeDoNotUse()
           .subscribeExTry(
-              folly::getEventBase(),
+              folly::getEventBaseKeepAlive(),
               [&received, &routeDbExpected3, &routeDbExpected4](auto&& t) {
                 if (!t.hasValue()) {
                   return;
@@ -767,7 +769,7 @@ TEST_F(FibTestFixture, fibStreamingTwoSubscribers) {
       std::move(responseAndSubscription_1.stream)
           .toClientStreamUnsafeDoNotUse()
           .subscribeExTry(
-              folly::getEventBase(),
+              folly::getEventBaseKeepAlive(),
               [&received_1, &routeDbExpected2](auto&& t) {
                 if (!t.hasValue()) {
                   return;
@@ -781,7 +783,7 @@ TEST_F(FibTestFixture, fibStreamingTwoSubscribers) {
       std::move(responseAndSubscription_2.stream)
           .toClientStreamUnsafeDoNotUse()
           .subscribeExTry(
-              folly::getEventBase(),
+              folly::getEventBaseKeepAlive(),
               [&received_2, &routeDbExpected2](auto&& t) {
                 if (!t.hasValue()) {
                   return;
@@ -870,7 +872,8 @@ TEST_F(FibTestFixture, fibDetailStreaming) {
       std::move(responseAndSubscription.stream)
           .toClientStreamUnsafeDoNotUse()
           .subscribeExTry(
-              folly::getEventBase(), [&received, &routeDbExpected2](auto&& t) {
+              folly::getEventBaseKeepAlive(),
+              [&received, &routeDbExpected2](auto&& t) {
                 if (!t.hasValue()) {
                   return;
                 }

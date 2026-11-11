@@ -1278,7 +1278,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, &diff, key](auto&& t) {
+                folly::getEventBaseKeepAlive(),
+                [&received, &diff, key](auto&& t) {
                   /*
                    * Consider publication only if `key` is present
                    * NOTE: There can be updates to prefix or adj keys
@@ -1384,26 +1385,28 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [&received, key](auto&& t) {
-              /*
-               * Consider publication only if `key` is present
-               * NOTE: There can be updates to prefix or adj keys
-               */
-              if (!t.hasValue() || !t->keyVals()->count(key)) {
-                return;
-              }
-              auto& pub = *t;
-              EXPECT_EQ(1, (*pub.keyVals()).size());
-              ASSERT_EQ(1, (*pub.keyVals()).count(key));
-              EXPECT_EQ("value4", (*pub.keyVals()).at(key).value().value());
-              received++;
-            });
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [&received, key](auto&& t) {
+                  /*
+                   * Consider publication only if `key` is present
+                   * NOTE: There can be updates to prefix or adj keys
+                   */
+                  if (!t.hasValue() || !t->keyVals()->count(key)) {
+                    return;
+                  }
+                  auto& pub = *t;
+                  EXPECT_EQ(1, (*pub.keyVals()).size());
+                  ASSERT_EQ(1, (*pub.keyVals()).count(key));
+                  EXPECT_EQ("value4", (*pub.keyVals()).at(key).value().value());
+                  received++;
+                });
 
     auto subscription_other =
         std::move(responseAndSubscription_other.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, random_key](auto&& t) {
+                folly::getEventBaseKeepAlive(),
+                [&received, random_key](auto&& t) {
                   if (!t.hasValue() || !t->keyVals()->count(random_key)) {
                     return;
                   }
@@ -1477,24 +1480,26 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [&received, key](auto&& t) {
-              /*
-               * Consider publication only if `key` is present
-               * NOTE: There can be updates to prefix or adj keys
-               */
-              if (!t.hasValue() || !t->keyVals()->count(key)) {
-                return;
-              }
-              auto& pub = *t;
-              EXPECT_EQ(1, (*pub.keyVals()).size());
-              ASSERT_EQ(1, (*pub.keyVals()).count(key));
-              /*
-               * Validates value is set with KeyDumpParams.doNotPublishValue =
-               * false
-               */
-              EXPECT_EQ("value333", (*pub.keyVals()).at(key).value().value());
-              received++;
-            });
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [&received, key](auto&& t) {
+                  /*
+                   * Consider publication only if `key` is present
+                   * NOTE: There can be updates to prefix or adj keys
+                   */
+                  if (!t.hasValue() || !t->keyVals()->count(key)) {
+                    return;
+                  }
+                  auto& pub = *t;
+                  EXPECT_EQ(1, (*pub.keyVals()).size());
+                  ASSERT_EQ(1, (*pub.keyVals()).count(key));
+                  /*
+                   * Validates value is set with KeyDumpParams.doNotPublishValue
+                   * = false
+                   */
+                  EXPECT_EQ(
+                      "value333", (*pub.keyVals()).at(key).value().value());
+                  received++;
+                });
 
     EXPECT_EQ(1, handler_->getNumKvStorePublishers());
     kvStoreWrapper_->setKey(
@@ -1552,7 +1557,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, keyvals](auto&& t) {
+                folly::getEventBaseKeepAlive(), [&received, keyvals](auto&& t) {
                   if (!t.hasValue()) {
                     return;
                   }
@@ -1633,7 +1638,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, keyvals](auto&& t) {
+                folly::getEventBaseKeepAlive(), [&received, keyvals](auto&& t) {
                   if (!t.hasValue()) {
                     return;
                   }
@@ -1723,7 +1728,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, keyvals](auto&& t) {
+                folly::getEventBaseKeepAlive(), [&received, keyvals](auto&& t) {
                   if (!t.hasValue()) {
                     return;
                   }
@@ -1802,16 +1807,17 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [&received, key](auto&& t) {
-              if (!t.hasValue() || !t->keyVals()->count(key)) {
-                return;
-              }
-              auto& pub = *t;
-              EXPECT_EQ(1, (*pub.keyVals()).size());
-              ASSERT_EQ(1, (*pub.keyVals()).count(key));
-              EXPECT_EQ("value1", (*pub.keyVals()).at(key).value().value());
-              received++;
-            });
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [&received, key](auto&& t) {
+                  if (!t.hasValue() || !t->keyVals()->count(key)) {
+                    return;
+                  }
+                  auto& pub = *t;
+                  EXPECT_EQ(1, (*pub.keyVals()).size());
+                  ASSERT_EQ(1, (*pub.keyVals()).count(key));
+                  EXPECT_EQ("value1", (*pub.keyVals()).at(key).value().value());
+                  received++;
+                });
 
     EXPECT_EQ(1, handler_->getNumKvStorePublishers());
     kvStoreWrapper_->setKey(
@@ -1864,7 +1870,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [&received, keyvals](auto&& t) {
+                folly::getEventBaseKeepAlive(), [&received, keyvals](auto&& t) {
                   if (!t.hasValue()) {
                     return;
                   }
@@ -1995,7 +2001,8 @@ CO_TEST_F(
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
             .subscribeExTry(
-                folly::getEventBase(), [keyvals, &newTtlVersionSeen](auto&& t) {
+                folly::getEventBaseKeepAlive(),
+                [keyvals, &newTtlVersionSeen](auto&& t) {
                   if (!t.hasValue()) {
                     return;
                   }
@@ -2091,24 +2098,25 @@ CO_TEST_F(
     auto subscription =
         std::move(responseAndSubscription.stream)
             .toClientStreamUnsafeDoNotUse()
-            .subscribeExTry(folly::getEventBase(), [keyvals](auto&& t) {
-              if (!t.hasValue()) {
-                return;
-              }
+            .subscribeExTry(
+                folly::getEventBaseKeepAlive(), [keyvals](auto&& t) {
+                  if (!t.hasValue()) {
+                    return;
+                  }
 
-              for (const auto& kv : keyvals) {
-                if (!t->keyVals()->count(kv.first)) {
-                  continue;
-                }
-                auto& pub = *t;
-                EXPECT_EQ(1, (*pub.keyVals()).size());
-                ASSERT_EQ(1, (*pub.keyVals()).count(kv.first));
-                if ((*pub.keyVals()).count("key3") == 1) {
-                  const auto& val = (*pub.keyVals())["key3"];
-                  EXPECT_LE(6, *val.ttlVersion());
-                }
-              }
-            });
+                  for (const auto& kv : keyvals) {
+                    if (!t->keyVals()->count(kv.first)) {
+                      continue;
+                    }
+                    auto& pub = *t;
+                    EXPECT_EQ(1, (*pub.keyVals()).size());
+                    ASSERT_EQ(1, (*pub.keyVals()).count(kv.first));
+                    if ((*pub.keyVals()).count("key3") == 1) {
+                      const auto& val = (*pub.keyVals())["key3"];
+                      EXPECT_LE(6, *val.ttlVersion());
+                    }
+                  }
+                });
 
     EXPECT_EQ(1, handler_->getNumKvStorePublishers());
 
