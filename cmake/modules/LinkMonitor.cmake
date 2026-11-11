@@ -57,7 +57,7 @@ macro(openr_add_link_monitor_libraries)
       openr_config_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
       ${RE2}
   )

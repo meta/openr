@@ -30,7 +30,7 @@ macro(openr_add_lsdb_library)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
   )
   add_library(OpenR::rib_entry ALIAS openr_rib_entry)
@@ -54,7 +54,7 @@ macro(openr_add_lsdb_library)
       openr_config_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       ${RE2}
       ${Boost_LIBRARIES}
   )

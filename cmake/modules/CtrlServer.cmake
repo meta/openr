@@ -45,7 +45,7 @@ macro(openr_add_ctrl_server_library)
       openr_ctrl_cpp_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::ctrl_handler ALIAS openr_ctrl_handler)
 endmacro()

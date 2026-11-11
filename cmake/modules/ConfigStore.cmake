@@ -22,7 +22,7 @@ macro(openr_add_config_store_library)
       openr_common
       openr_config
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::persistent_store ALIAS openr_persistent_store)
 endmacro()

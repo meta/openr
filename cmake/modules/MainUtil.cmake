@@ -26,7 +26,7 @@ macro(openr_add_main_util_library)
       openr_kvstore_peer_ingress_limit
       openr_watchdog
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
       Threads::Threads
       wangle::wangle_ssl_ssl_context_config

@@ -52,7 +52,7 @@ macro(openr_add_spark_libraries)
       openr_messaging
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::spark ALIAS openr_spark)
 

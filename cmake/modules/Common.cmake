@@ -155,7 +155,7 @@ macro(openr_add_common_libraries)
       types_cpp2
       fmt::fmt
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::network_util ALIAS openr_network_util)
 
@@ -181,7 +181,7 @@ macro(openr_add_common_libraries)
       kv_store_cpp2
       fb303::fb303
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       ${Boost_LIBRARIES}
   )
   add_library(OpenR::util ALIAS openr_util)
@@ -194,7 +194,7 @@ macro(openr_add_common_libraries)
     PUBLIC_DEPENDENCIES
       openr_constants
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::client_util ALIAS openr_client_util)
 endmacro()

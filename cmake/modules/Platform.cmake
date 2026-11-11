@@ -29,7 +29,7 @@ macro(openr_add_platform_library)
       platform_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::netlink_fib_handler ALIAS openr_netlink_fib_handler)
 endmacro()

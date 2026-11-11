@@ -33,7 +33,7 @@ macro(openr_add_kvstore_libraries)
       openr_config
       kv_store_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::kvstore_util ALIAS openr_kvstore_util)
 
@@ -65,7 +65,7 @@ macro(openr_add_kvstore_libraries)
       kv_store_cpp2
       fb303::fb303
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::kvstore ALIAS openr_kvstore)
 
@@ -80,7 +80,7 @@ macro(openr_add_kvstore_libraries)
       openr_kvstore_ingress_observer
       fb303::fb303
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(
     OpenR::kvstore_peer_ingress_limit ALIAS openr_kvstore_peer_ingress_limit
@@ -94,7 +94,7 @@ macro(openr_add_kvstore_libraries)
       openr_kvstore_peer_ingress_limit
       kv_store_cpp2
       fb303::fb303
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(
     OpenR::kvstore_service_handler ALIAS openr_kvstore_service_handler
@@ -116,7 +116,7 @@ macro(openr_add_kvstore_libraries)
       kv_store_cpp2
       openr_ctrl_cpp_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       wangle::wangle_ssl_ssl_context_config
   )
   add_library(OpenR::kvstore_wrapper ALIAS openr_kvstore_wrapper)

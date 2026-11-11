@@ -37,7 +37,7 @@ macro(openr_add_prefix_manager_library)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::prefix_manager ALIAS openr_prefix_manager)
 endmacro()

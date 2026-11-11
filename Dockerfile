@@ -18,7 +18,7 @@ RUN apt update && \
 
 # Copy needed source
 RUN mkdir /src
-ADD CMakeLists.txt FBGenCMakeBuildInfo.cmake ThriftLibrary.cmake /src/
+ADD CMakeLists.txt FBGenCMakeBuildInfo.cmake /src/
 COPY build /src/build
 COPY openr /src/openr
 # OpenR's CMakeLists builds routing_policy.thrift from

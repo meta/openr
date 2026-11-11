@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.14)
 project(openr)
 
 # The full profile builds the complete Open/R daemon, tools, tests, and
@@ -88,7 +88,7 @@ set(
   "${CMAKE_SOURCE_DIR}"
   ${CMAKE_MODULE_PATH}
 )
-include(FBThriftCppLibrary)
+include(FBCMakeParseArgs)
 include(FBGenCMakeBuildInfo)
 
 set(REQ_BOOST_COMPONENTS ${REQ_BOOST_COMPONENTS} system thread context filesystem program_options regex)
@@ -125,7 +125,7 @@ add_compile_definitions(NO_FOLLY_EXCEPTION_TRACER)
 include_directories(
   ${Boost_INCLUDE_DIR}
   ${FB303_INCLUDE_DIR}
-  ${FBTHRIFT_INCLUDE_DIR}
+  ${THRIFT_INCLUDE_DIR}
   ${FOLLY_INCLUDE_DIR}
   ${RE2_INCLUDE_DIR}
   ${Xxhash_INCLUDE_DIR}
@@ -162,17 +162,19 @@ set(OPENR_EXPORTED_TARGETS
   ${OPENR_EXPORTED_THRIFT_TARGETS}
 )
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   routing_policy_cpp2
   configerator/structs/neteng/config/routing_policy.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} routing_policy_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   openr_config_cpp2
   openr/if/OpenrConfig.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
   DEPENDS
@@ -180,17 +182,19 @@ add_fbthrift_cpp_library(
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} openr_config_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   network_cpp2
   openr/if/Network.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} network_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   platform_cpp2
   openr/if/Platform.thrift
+  LANGUAGE cpp2
   SERVICES
     FibService
     NeighborListenerClientForFibagent
@@ -203,17 +207,19 @@ add_fbthrift_cpp_library(
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} platform_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   dual_cpp2
   openr/if/Dual.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} dual_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   kv_store_cpp2
   openr/if/KvStore.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
   DEPENDS
@@ -224,9 +230,10 @@ add_fbthrift_cpp_library(
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} kv_store_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   types_cpp2
   openr/if/Types.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
   DEPENDS
@@ -235,17 +242,19 @@ add_fbthrift_cpp_library(
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} types_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   health_cpp2
   openr/if/Health.thrift
+  LANGUAGE cpp2
   OPTIONS
     json
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} health_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   openr_ctrl_cpp2
   openr/if/OpenrCtrl.thrift
+  LANGUAGE cpp2
   SERVICES
     OpenrCtrl
   OPTIONS
@@ -260,9 +269,10 @@ add_fbthrift_cpp_library(
 )
 SET(OPENR_THRIFT_LIBS ${OPENR_THRIFT_LIBS} openr_ctrl_cpp2)
 
-add_fbthrift_cpp_library(
+thrift_add_library(
   openr_ctrl_cpp_cpp2
   openr/if/OpenrCtrlCpp.thrift
+  LANGUAGE cpp2
   SERVICES
     OpenrCtrlCpp
   OPTIONS
@@ -388,7 +398,7 @@ target_link_libraries(openr
   ${GFLAGS}
   ${THRIFT}
   ${ZSTD}
-  FBThrift::thriftcpp2
+  thrift::rpc
   ${ASYNC}
   ${CONCURRENCY}
   Folly::folly
@@ -420,7 +430,6 @@ if(BUILD_TOOLS)
     ${GFLAGS}
     ${THRIFT}
     ${ZSTD}
-    ${THRIFTCPP2}
     ${ASYNC}
     ${TRANSPORT}
     ${CONCURRENCY}
@@ -450,7 +459,7 @@ target_link_libraries(platform_linux
   glog::glog
   gflags
   Folly::folly
-  FBThrift::thriftcpp2
+  thrift::rpc
   -lpthread
 )
 
@@ -466,23 +475,15 @@ install(TARGETS
 if (OPENR_BUILD_PROFILE STREQUAL "exported_libraries")
   set(OPENR_INSTALL_ENABLED TRUE)
 
-  # add_fbthrift_cpp_library populates PUBLIC_HEADER and HEADER_INSTALL_DIR
-  # with the generated headers and their include destination.
+  # thrift_add_library() populates PUBLIC_HEADER and THRIFT_HEADER_DIR with
+  # the generated headers and their directory under the include directory.
   foreach(OPENR_THRIFT_LIB IN LISTS OPENR_EXPORTED_THRIFT_TARGETS)
-    get_target_property(
-      OPENR_THRIFT_HEADER_INSTALL_DIR
-      ${OPENR_THRIFT_LIB}
-      HEADER_INSTALL_DIR
-    )
-    if (NOT OPENR_THRIFT_HEADER_INSTALL_DIR)
-      message(FATAL_ERROR
-        "HEADER_INSTALL_DIR is not set for ${OPENR_THRIFT_LIB}")
-    endif()
     install(
       TARGETS ${OPENR_THRIFT_LIB}
       ARCHIVE DESTINATION lib
       LIBRARY DESTINATION lib
-      PUBLIC_HEADER DESTINATION ${OPENR_THRIFT_HEADER_INSTALL_DIR}
+      PUBLIC_HEADER DESTINATION
+        "include/$<TARGET_PROPERTY:${OPENR_THRIFT_LIB},THRIFT_HEADER_DIR>"
     )
   endforeach()
 
@@ -761,7 +762,7 @@ if(BUILD_TESTS)
       openr_io_provider
       ${GLOG}
       ${GFLAGS}
-      FBThrift::thriftcpp2
+      thrift::rpc
       ${ZSTD}
       Folly::folly
       ${FOLLY_EXCEPTION_TRACER}
@@ -866,7 +867,7 @@ if(BUILD_TESTS)
       glog::glog
       gflags
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
     DESTINATION sbin/tests/openr/common
   )
 
@@ -1203,7 +1204,7 @@ if(BUILD_TESTS)
         network_cpp2
         fb303::fb303
         Folly::folly
-        FBThrift::thriftcpp2
+        thrift::rpc
         glog::glog
         gflags
       DESTINATION sbin/tests/openr/nl
@@ -1339,7 +1340,6 @@ if(BUILD_TESTS)
     ${GMOCK_MAIN}
     ${GTEST_BOTH_LIBRARIES}
     ${GTEST_MAIN}
-    ${THRIFTCPP2}
     ${BENCHMARK}
   )
 
@@ -1380,7 +1380,6 @@ if(BUILD_TESTS)
     ${GMOCK_MAIN}
     ${GTEST_BOTH_LIBRARIES}
     ${GTEST_MAIN}
-    ${THRIFTCPP2}
     ${BENCHMARK}
   )
 

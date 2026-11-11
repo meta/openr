@@ -19,7 +19,7 @@ macro(openr_add_policy_library)
       openr_policy_struct
       routing_policy_cpp2
       types_cpp2
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::policy ALIAS openr_policy)
 endmacro()

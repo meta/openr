@@ -76,7 +76,7 @@ macro(openr_add_test_support_libraries)
       types_cpp2
       fmt::fmt
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
       Threads::Threads
   )
@@ -133,7 +133,7 @@ macro(openr_add_test_support_libraries)
       types_cpp2
       ${BENCHMARK}
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
       Threads::Threads
   )

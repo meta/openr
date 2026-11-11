@@ -30,7 +30,7 @@ macro(openr_add_netlink_library)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       glog::glog
   )
   add_library(OpenR::fbnl ALIAS openr_fbnl)

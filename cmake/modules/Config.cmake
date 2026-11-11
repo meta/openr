@@ -28,7 +28,7 @@ macro(openr_add_config_library)
       kv_store_cpp2
       openr_config_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
       ${RE2}
       stdc++fs
   )

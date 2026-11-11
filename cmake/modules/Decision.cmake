@@ -27,7 +27,7 @@ macro(openr_add_decision_libraries)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::link ALIAS openr_link)
 
@@ -45,7 +45,7 @@ macro(openr_add_decision_libraries)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::decision_structs ALIAS openr_decision_structs)
 
@@ -69,7 +69,7 @@ macro(openr_add_decision_libraries)
       types_cpp2
       openr_messaging
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::fabric_helper ALIAS openr_fabric_helper)
 
@@ -94,7 +94,7 @@ macro(openr_add_decision_libraries)
       network_cpp2
       types_cpp2
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::spf_solver ALIAS openr_spf_solver)
 
@@ -124,7 +124,7 @@ macro(openr_add_decision_libraries)
       types_cpp2
       openr_messaging
       Folly::folly
-      FBThrift::thriftcpp2
+      thrift::rpc
   )
   add_library(OpenR::decision ALIAS openr_decision)
 endmacro()
