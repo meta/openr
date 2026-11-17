@@ -19,7 +19,20 @@ FabricHelper::getFabricName() const {
   return fabricConfig_.getFabricName();
 }
 
-std::string
+/*
+ * For a link between fabric leaf X and external node Y, we get three
+ * adjacencies:
+ *  - X->Y in adj:X
+ *  - Y->Fabric in adj:Y
+ *  - Fabric->Y in adj:Fabric (synthetic KV injected by master generator)
+ * If X->Y comes before Y->Fabric, we return "X" instead of "Fabric" for
+ * Y->Fabric and get the real X<->Y link. However, if Y->Fabric arrives before
+ * X->Y, there is no leaf to return. Returning "Fabric" would make the virtual
+ * link Fabric<->Y bidirectional, and Open/R would incorrectly install the
+ * virtual fabric prefixes on a fabric node. Returning std::nullopt instead
+ * ensures that no link has the fabric at either end.
+ */
+std::optional<std::string>
 FabricHelper::getRealOtherNodeName(
     const std::string& nodeName, const thrift::Adjacency& adj) const {
   if (*adj.otherNodeName() == fabricConfig_.getFabricName()) {
@@ -28,6 +41,7 @@ FabricHelper::getRealOtherNodeName(
     if (leaf != externalNodeToLeaf_.end()) {
       return leaf->second.nodeName;
     }
+    return std::nullopt;
   }
   return *adj.otherNodeName();
 }

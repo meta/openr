@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <optional>
+
 #include <fmt/format.h>
 #include <folly/Range.h>
 #include <folly/container/F14Map.h>
@@ -49,8 +51,11 @@ class FabricHelper {
   // Returns the name of the fabric.
   std::string getFabricName() const;
 
-  // Returns the name of the leaf that the external link is connected to.
-  std::string getRealOtherNodeName(
+  /*
+   * Returns the name of the leaf that the external link is connected to, or
+   * std::nullopt if adj points to the fabric but no leaf has that link.
+   */
+  std::optional<std::string> getRealOtherNodeName(
       const std::string& nodeName, const thrift::Adjacency& adj) const;
 
   void updateExternalNodeToLeafMap(

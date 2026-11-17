@@ -170,9 +170,8 @@ TEST_F(FabricHelperTestFixture, GetRealOtherNodeName_FabricWithoutMapping) {
   thrift::Adjacency extAdj = createAdjacency(
       "bbf01.dfw1", "po1001", "po1000", "fe80::3", "10.0.0.3", 1, 0);
 
-  // Falls back to returning the fabric name
   EXPECT_THAT(
-      helper.getRealOtherNodeName("eb01.rva1", extAdj), Eq("bbf01.dfw1"));
+      helper.getRealOtherNodeName("eb01.rva1", extAdj), Eq(std::nullopt));
 }
 
 TEST_F(FabricHelperTestFixture, UpdateExternalNodeToLeafMap_LeafNode) {

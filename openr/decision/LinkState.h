@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include <folly/container/F14Map.h>
 #include <openr/common/Constants.h>
 #include <openr/decision/FabricHelper.h>
@@ -383,9 +385,10 @@ class LinkState {
 
   /*
    * Returns the leaf node's name if the other node name stored in the
-   * adj is the fabric name; otherwise, returns the other node name from adj.
+   * adj is the fabric name, or std::nullopt if no leaf has that link;
+   * otherwise, returns the other node name from adj.
    */
-  std::string getRealOtherNodeName(
+  std::optional<std::string> getRealOtherNodeName(
       const std::string& nodeName, const thrift::Adjacency& adj) const;
 
   // this stores the same link object accessible from either nodeName

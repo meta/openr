@@ -531,6 +531,135 @@ TEST(LinkStateTest, WithFabricHelper) {
   EXPECT_THAT(links, SizeIs(1));
 }
 
+/*
+ * Data leaf X of fabric instance BBF is connected to external peer Y:
+ *   X's adj: X%x-y -> Y%y-x
+ *   Y's adj: Y%y-x -> BBF%x-y (Y peers with the fabric under its instance name)
+ *   BBF's adj (generated): BBF%x-y -> Y%y-x
+ * Y -> BBF must resolve to X so X <-> Y forms one link, while BBF -> Y must not
+ * pair with Y -> BBF, in whatever order the databases arrive.
+ */
+TEST(LinkStateTest, FabricBoundaryLinkIsLeafToExternalOnly) {
+  const std::string fabricName{"bbf01.dfw1"};
+  const std::string leafName{"bbf01-ld001.dfw1"};
+  const std::string externalName{"eb01.rva1"};
+  thrift::FabricConfig thriftCfg;
+  thriftCfg.fabric_name() = fabricName;
+  thriftCfg.fabric_leaf_regexes() = {"bbf01-ld\\d{3}\\.dfw1"};
+  thriftCfg.fabric_spine_regexes() = {"bbf01-sp\\d{3}\\.dfw1"};
+  const FabricConfig fabricCfg(thriftCfg);
+
+  const auto leafDb = createAdjDb(
+      leafName,
+      {createComputedTestAdjacency(externalName, "x-y", "y-x")},
+      kComputedNodeLabel);
+  const auto externalDb = createAdjDb(
+      externalName,
+      {createComputedTestAdjacency(fabricName, "y-x", "x-y")},
+      kComputedNodeLabel);
+  const auto fabricDb = createAdjDb(
+      fabricName,
+      {createComputedTestAdjacency(externalName, "x-y", "y-x")},
+      kComputedNodeLabel);
+
+  const auto byName = [](const auto& a, const auto& b) {
+    return *a.thisNodeName() < *b.thisNodeName();
+  };
+  std::vector<thrift::AdjacencyDatabase> order{leafDb, externalDb, fabricDb};
+  std::sort(order.begin(), order.end(), byName);
+  do {
+    std::vector<std::string> names;
+    names.reserve(order.size());
+    for (const auto& db : order) {
+      names.push_back(*db.thisNodeName());
+    }
+    SCOPED_TRACE(folly::join(", ", names));
+
+    messaging::ReplicateQueue<KeyValueRequest> kvRequestQueue;
+    LinkState state{kTestingAreaName, leafName};
+    state.addFabricHelper(fabricCfg, leafName, kvRequestQueue);
+    for (const auto& db : order) {
+      state.updateAdjacencyDatabase(db, kTestingAreaName);
+    }
+
+    EXPECT_THAT(state.linksFromNode(fabricName), IsEmpty());
+    ASSERT_THAT(state.linksFromNode(leafName), SizeIs(1));
+    const auto& link = *state.linksFromNode(leafName).begin();
+    EXPECT_EQ(externalName, link->getOtherNodeName(leafName));
+    EXPECT_EQ("x-y", link->getIfaceFromNode(leafName));
+    EXPECT_EQ("y-x", link->getIfaceFromNode(externalName));
+    EXPECT_TRUE(link->isUp());
+    EXPECT_THAT(state.linksFromNode(externalName), Contains(link));
+    kvRequestQueue.close();
+  } while (std::next_permutation(order.begin(), order.end(), byName));
+}
+
+/*
+ * A spine sees the fabric node bbf01.dfw1 only through one-way adjacencies:
+ * the external node's adjacency towards bbf01.dfw1 resolves to the leaf, so
+ * bbf01.dfw1 must stay unreachable and its prefixes uninstalled. A KvStore full
+ * sync delivers adj: keys in unordered_map order, so the result must not depend
+ * on the order the three databases arrive in.
+ */
+TEST(LinkStateTest, FabricNodeUnreachableFromSpineInAnyOrder) {
+  const std::string fabricName{"bbf01.dfw1"};
+  const std::string spineName{"bbf01-sp001.dfw1"};
+  const std::string leafName{"bbf01-ld001.dfw1"};
+  const std::string externalName{"eb01.rva1"};
+  thrift::FabricConfig thriftCfg;
+  thriftCfg.fabric_name() = fabricName;
+  thriftCfg.fabric_leaf_regexes() = {"bbf01-ld\\d{3}\\.dfw1"};
+  thriftCfg.fabric_spine_regexes() = {"bbf01-sp\\d{3}\\.dfw1"};
+  thriftCfg.fabric_control_regexes() = {"bbf01-lc\\d{3}\\.dfw1"};
+  const FabricConfig fabricCfg(thriftCfg);
+
+  const auto spineDb = createAdjDb(
+      spineName,
+      {createComputedTestAdjacency(leafName, "sp-ld", "ld-sp")},
+      kComputedNodeLabel);
+  const auto leafDb = createAdjDb(
+      leafName,
+      {createComputedTestAdjacency(spineName, "ld-sp", "sp-ld"),
+       createComputedTestAdjacency(externalName, "ld-eb", "eb-ld")},
+      kComputedNodeLabel);
+  const auto externalDb = createAdjDb(
+      externalName,
+      {createComputedTestAdjacency(fabricName, "eb-ld", "ld-eb")},
+      kComputedNodeLabel);
+  const auto fabricDb = createAdjDb(
+      fabricName,
+      {createComputedTestAdjacency(externalName, "ld-eb", "eb-ld")},
+      kComputedNodeLabel);
+
+  const auto byName = [](const auto& a, const auto& b) {
+    return *a.thisNodeName() < *b.thisNodeName();
+  };
+  std::vector<thrift::AdjacencyDatabase> order{
+      spineDb, leafDb, externalDb, fabricDb};
+  std::sort(order.begin(), order.end(), byName);
+  do {
+    std::vector<std::string> names;
+    names.reserve(order.size());
+    for (const auto& db : order) {
+      names.push_back(*db.thisNodeName());
+    }
+    SCOPED_TRACE(folly::join(", ", names));
+
+    messaging::ReplicateQueue<KeyValueRequest> kvRequestQueue;
+    LinkState state{kTestingAreaName, spineName};
+    state.addFabricHelper(fabricCfg, spineName, kvRequestQueue);
+    for (const auto& db : order) {
+      state.updateAdjacencyDatabase(db, kTestingAreaName);
+    }
+
+    EXPECT_THAT(state.linksFromNode(fabricName), IsEmpty());
+    const auto& spf = state.getSpfResult(spineName);
+    EXPECT_TRUE(spf.contains(externalName));
+    EXPECT_FALSE(spf.contains(fabricName));
+    kvRequestQueue.close();
+  } while (std::next_permutation(order.begin(), order.end(), byName));
+}
+
 TEST(LinkStateTest, getKthPaths) {
   {
     /*

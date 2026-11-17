@@ -150,11 +150,12 @@ LinkState::getAdjacencyDatabasesComputed() const {
     auto& computedAdjs = *computedDb.adjacencies();
     computedAdjs.clear();
     for (const auto& adj : *adjDb.adjacencies()) {
+      const auto peer = getRealOtherNodeName(nodeName, adj);
+      if (!peer) {
+        continue;
+      }
       const auto peerOverload = peerOverloads.find(
-          std::make_tuple(
-              *adj.ifName(),
-              getRealOtherNodeName(nodeName, adj),
-              *adj.otherIfName()));
+          std::make_tuple(*adj.ifName(), *peer, *adj.otherIfName()));
       if (peerOverload == peerOverloads.end()) {
         continue;
       }
@@ -176,7 +177,7 @@ LinkState::orderedLinksFromNode(const std::string& nodeName) const {
   return links;
 }
 
-std::string
+std::optional<std::string>
 LinkState::getRealOtherNodeName(
     const std::string& nodeName, const thrift::Adjacency& adj) const {
   if (fabricHelper_) {
@@ -293,22 +294,22 @@ std::shared_ptr<Link>
 LinkState::maybeMakeLink(
     const std::string& nodeName, const thrift::Adjacency& adj) const {
   // only return Link if it is bidirectional.
-  std::string adjOtherNodeName = getRealOtherNodeName(nodeName, adj);
-  auto search = adjacencyDatabases_.find(adjOtherNodeName);
+  const std::optional<std::string> adjOtherNodeName =
+      getRealOtherNodeName(nodeName, adj);
+  if (!adjOtherNodeName) {
+    return nullptr;
+  }
+  auto search = adjacencyDatabases_.find(*adjOtherNodeName);
   if (search != adjacencyDatabases_.end()) {
     for (const auto& otherAdj : *search->second.adjacencies()) {
-      if (nodeName == getRealOtherNodeName(adjOtherNodeName, otherAdj) &&
+      if (nodeName == getRealOtherNodeName(*adjOtherNodeName, otherAdj) &&
           *adj.otherIfName() == *otherAdj.ifName() &&
           *adj.ifName() == *otherAdj.otherIfName()) {
         // link is usable, only if both adj are usable by us.
-        const std::string& myNodeName =
-            fabricHelper_ && adjOtherNodeName == fabricHelper_->getFabricName()
-            ? fabricHelper_->getFabricName()
-            : myNodeName_;
         bool usable =
-            adjUsable(adj, myNodeName) && adjUsable(otherAdj, myNodeName_);
+            adjUsable(adj, myNodeName_) && adjUsable(otherAdj, myNodeName_);
         return std::make_shared<Link>(
-            area_, nodeName, adj, adjOtherNodeName, otherAdj, usable);
+            area_, nodeName, adj, *adjOtherNodeName, otherAdj, usable);
       }
     }
   }
