@@ -117,6 +117,148 @@ struct TestStatus {
   7: optional i32 neighborCount;
 }
 
+/*
+ * KvStore stream test clients. Each subscriber and each poller opens its own
+ * connection to the DUT control port (DutConnection, default 2018).
+ */
+
+// Identical subscribers on subscribeAndGetAreaKvStores.
+struct StreamSubscriberGroup {
+  1: i32 count = 1;
+  // KeyDumpParams.keys, e.g. ["adj:", "prefix:"]. Empty = all keys.
+  2: list<string> keyPrefixes;
+  // selectAreas, e.g. ["0"]. Empty = all areas.
+  3: set<string> areas;
+  // KeyDumpParams.senderId. "{id}" becomes the subscriber id, e.g.
+  // "scale-{id}" gives scale-0, scale-1. Unset = no senderId.
+  4: optional string senderId;
+  5: bool ignoreTtl = true;
+  // Wait after each message before the next read, in ms.
+  6: i32 readDelayMs = 0;
+  // Client stream buffer in messages: the credits granted at subscription
+  // (Thrift chunk buffer size). 0 = no credit until the first read.
+  7: i32 bufferSize = 100;
+  // Wait before a new subscription after a stream end or a failed
+  // subscribe, in ms. Negative = no new subscription.
+  8: i32 reconnectDelayMs = 2000;
+  // Start without reads, as StreamSubscriberChange.stalled.
+  9: bool stalled = false;
+}
+
+// Identical pollers on getKvStoreKeyValsFilteredArea.
+struct StreamPollerGroup {
+  1: i32 count = 1;
+  // KeyDumpParams.keys. Empty = all keys.
+  2: list<string> keyPrefixes;
+  3: string area = "0";
+  // Wait between the end of one poll and the next, in ms.
+  4: i32 intervalMs = 1000;
+  // KeyDumpParams.senderId, as StreamSubscriberGroup.senderId.
+  5: optional string senderId;
+}
+
+// Subscriber ids number the subscribers of all groups from 0 in config
+// order; poller ids do the same for pollers.
+struct StreamClientsConfig {
+  1: list<StreamSubscriberGroup> subscribers;
+  2: list<StreamPollerGroup> pollers;
+  /*
+   * DUT control port, e.g. {host: "::1", port: 2018}. The clients need no
+   * running Open/R: each connection attempt resolves the host again, and a
+   * failed attempt ends with CONNECTION and waits for the next one.
+   */
+  3: DutConnection dut;
+}
+
+// Change to running subscribers. Unset fields keep their value.
+struct StreamSubscriberChange {
+  // Empty = all subscribers.
+  1: list<i32> ids;
+  2: optional i32 readDelayMs;
+  // true: stop reading, so the client grants no credit. false: read again.
+  3: optional bool stalled;
+  // Applies from the next subscription.
+  4: optional i32 bufferSize;
+  // Cancel the current stream and subscribe again without the reconnect
+  // delay.
+  5: bool reconnect = false;
+}
+
+enum StreamEndReason {
+  NONE = 0,
+  // Subscribe RPC rejected by the DUT admission check.
+  LOADSHEDDING = 1,
+  // DUT closed the stream at its per-stream queue limit.
+  OVERFLOW = 2,
+  // DUT closed the stream at its total stream budget.
+  BUDGET = 3,
+  // Thrift cancelled the stream: no client credit for streamExpireTime.
+  CREDIT_TIMEOUT = 4,
+  // DUT handler shutdown ("publisher terminated").
+  SHUTDOWN = 5,
+  // Connection failure or closure.
+  CONNECTION = 6,
+  // DUT completed the stream without error.
+  COMPLETED = 7,
+  // This client cancelled the stream: reconnect or stop.
+  CLIENT_CANCEL = 8,
+  OTHER = 99,
+}
+
+enum StreamSubscriberState {
+  CONNECTING = 0,
+  STREAMING = 1,
+  STALLED = 2,
+  // Waiting for the reconnect delay.
+  WAITING = 3,
+  STOPPED = 4,
+}
+
+// Byte counts are the Thrift Compact size estimates (serializedSizeZC) that
+// Open/R uses for its stream limits.
+struct StreamSubscriberStats {
+  1: i32 id;
+  2: StreamSubscriberState state;
+  3: i32 readDelayMs;
+  4: i32 bufferSize;
+  5: bool stalled;
+  // Subscribe RPCs sent, and the ones that returned a snapshot.
+  6: i32 subscribeAttempts;
+  7: i32 subscriptions;
+  // Subscribe attempts after the first one.
+  8: i32 reconnects;
+  // Last snapshot: all areas, and the subscribe RPC latency.
+  9: i64 snapshotBytes;
+  10: i64 snapshotKeys;
+  11: i64 snapshotLatencyMs;
+  // Stream messages over all subscriptions; keys count keyVals and
+  // expiredKeys.
+  12: i64 messagesReceived;
+  13: i64 bytesReceived;
+  14: i64 keysReceived;
+  15: StreamEndReason lastEndReason;
+  16: string lastError;
+  // Number of subscriptions and subscribe attempts per end reason.
+  17: map<StreamEndReason, i32> endReasons;
+}
+
+struct StreamPollerStats {
+  1: i32 id;
+  2: i64 polls;
+  3: i64 errors;
+  4: i64 lastBytes;
+  5: i64 lastKeys;
+  6: i64 lastLatencyMs;
+  7: i64 maxLatencyMs;
+  8: string lastError;
+}
+
+struct StreamClientsStats {
+  1: bool running;
+  2: list<StreamSubscriberStats> subscribers;
+  3: list<StreamPollerStats> pollers;
+}
+
 enum SetupErrorReason {
   TOPOLOGY_INVALID = 1,
   DUT_UNREACHABLE = 2,
