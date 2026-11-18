@@ -34,8 +34,11 @@ namespace fb303 = facebook::fb303;
 
 namespace {
 
-// TTL in ms
-const int64_t kTtlMs = 1000;
+/*
+ * TTL in ms. Full sync drops keys with less than `Constants::kTtlThreshold`
+ * left, so keys must outlive a slow peer sync with a wide margin.
+ */
+const int64_t kTtlMs = 30'000;
 
 // wait time before checking counter
 const std::chrono::milliseconds counterUpdateWaitTime(5500);
