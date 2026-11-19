@@ -166,6 +166,8 @@ struct StreamClientsConfig {
    * DUT control port, e.g. {host: "::1", port: 2018}. The clients need no
    * running Open/R: each connection attempt resolves the host again, and a
    * failed attempt ends with CONNECTION and waits for the next one.
+   * startStreamClients replaces an unset host with the DUT of the active
+   * session.
    */
   3: DutConnection dut;
 }
@@ -283,6 +285,10 @@ exception UnknownAdjacencyError {
   @thrift.ExceptionMessage
   1: string message;
 }
+exception StreamClientError {
+  @thrift.ExceptionMessage
+  1: string message;
+}
 exception SetupError {
   1: SetupErrorReason reason;
   @thrift.ExceptionMessage
@@ -377,7 +383,9 @@ service ScaleTestServer {
     3: UnknownAdjacencyError unknownAdj,
   );
 
-  // Empty regex = use the daemon's default counter set.
+  // Empty regex = use the daemon's default counter set. Without a session,
+  // reads the DUT of the stream clients. Empty when neither runs or the
+  // read fails.
   map<string, i64> getDutCounters(1: string regexFilter);
 
   // Structured report of the simulated Spark neighbors: aggregate packet stats
@@ -390,4 +398,20 @@ service ScaleTestServer {
   // operator calls it once the DUT is expected to have converged. Returns zero
   // counts if the injector's channel to the DUT is not connected.
   RouteCounts verifyRoutes() throws (1: NotRunningError notRunning);
+
+  /*
+   * KvStore stream test clients (StreamClientsConfig). They run with or
+   * without a session: startTest is optional, and stopTest leaves them
+   * running. At most one set of clients runs at a time.
+   */
+  void startStreamClients(1: StreamClientsConfig config) throws (
+    1: AlreadyRunningError already,
+    2: StreamClientError invalid,
+  );
+  void changeStreamSubscribers(1: StreamSubscriberChange change) throws (
+    1: StreamClientError invalid,
+  );
+  void stopStreamClients() throws (1: StreamClientError notStarted);
+  // running is false when no stream clients run.
+  StreamClientsStats getStreamClientsStats();
 }

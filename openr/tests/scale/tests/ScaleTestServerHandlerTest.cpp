@@ -141,4 +141,93 @@ TEST_F(ScaleTestServerHandlerTest, StartWithInvalidConfigStaysNotRunning) {
   EXPECT_THROW(client_->sync_startTest(invalid), thrift::SetupError);
 }
 
+namespace {
+
+/*
+ * One subscriber against a port that refuses connections. It fails its
+ * subscribe once and then waits for a reconnect request.
+ */
+thrift::StreamClientsConfig
+makeRefusedStreamClientsConfig() {
+  thrift::StreamSubscriberGroup group;
+  group.reconnectDelayMs() = -1;
+  thrift::StreamClientsConfig config;
+  config.subscribers() = {group};
+  config.dut()->host() = "::1";
+  config.dut()->port() = 1;
+  return config;
+}
+
+} // namespace
+
+TEST_F(ScaleTestServerHandlerTest, StreamClientsRunWithoutSession) {
+  client_->sync_startStreamClients(makeRefusedStreamClientsConfig());
+
+  thrift::StreamClientsStats stats;
+  client_->sync_getStreamClientsStats(stats);
+  EXPECT_TRUE(*stats.running());
+  EXPECT_EQ(1, stats.subscribers()->size());
+}
+
+TEST_F(ScaleTestServerHandlerTest, StartStreamClientsNeedsDutWithoutSession) {
+  EXPECT_THROW(
+      client_->sync_startStreamClients(thrift::StreamClientsConfig{}),
+      thrift::StreamClientError);
+}
+
+TEST_F(ScaleTestServerHandlerTest, StartStreamClientsTwiceThrows) {
+  client_->sync_startStreamClients(makeRefusedStreamClientsConfig());
+  EXPECT_THROW(
+      client_->sync_startStreamClients(makeRefusedStreamClientsConfig()),
+      thrift::AlreadyRunningError);
+}
+
+TEST_F(ScaleTestServerHandlerTest, StartStreamClientsRejectsInvalidConfig) {
+  auto config = makeRefusedStreamClientsConfig();
+  config.subscribers()->at(0).count() = -1;
+  EXPECT_THROW(
+      client_->sync_startStreamClients(config), thrift::StreamClientError);
+
+  thrift::StreamClientsStats stats;
+  client_->sync_getStreamClientsStats(stats);
+  EXPECT_FALSE(*stats.running());
+}
+
+TEST_F(ScaleTestServerHandlerTest, ChangeStreamSubscribersRejectsUnknownId) {
+  client_->sync_startStreamClients(makeRefusedStreamClientsConfig());
+  thrift::StreamSubscriberChange change;
+  change.ids() = {1};
+  EXPECT_THROW(
+      client_->sync_changeStreamSubscribers(change), thrift::StreamClientError);
+}
+
+TEST_F(
+    ScaleTestServerHandlerTest, ChangeStreamSubscribersWithoutClientsThrows) {
+  EXPECT_THROW(
+      client_->sync_changeStreamSubscribers(thrift::StreamSubscriberChange{}),
+      thrift::StreamClientError);
+}
+
+TEST_F(ScaleTestServerHandlerTest, StopStreamClientsEndsClients) {
+  client_->sync_startStreamClients(makeRefusedStreamClientsConfig());
+
+  client_->sync_stopStreamClients();
+
+  thrift::StreamClientsStats stats;
+  client_->sync_getStreamClientsStats(stats);
+  EXPECT_FALSE(*stats.running());
+  EXPECT_THROW(client_->sync_stopStreamClients(), thrift::StreamClientError);
+}
+
+/*
+ * Without a session, getDutCounters reads the DUT of the stream clients. A
+ * DUT that refuses connections gives an empty map.
+ */
+TEST_F(ScaleTestServerHandlerTest, GetDutCountersWithStreamClientsDutDown) {
+  client_->sync_startStreamClients(makeRefusedStreamClientsConfig());
+  std::map<std::string, int64_t> out;
+  client_->sync_getDutCounters(out, "");
+  EXPECT_TRUE(out.empty());
+}
+
 } // namespace openr

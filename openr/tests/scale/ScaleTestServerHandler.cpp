@@ -7,7 +7,10 @@
 
 #include <openr/tests/scale/ScaleTestServerHandler.h>
 
+#include <stdexcept>
 #include <utility>
+
+#include <folly/logging/xlog.h>
 
 namespace openr {
 
@@ -40,6 +43,13 @@ thrift::NotRunningError
 makeNotRunning() {
   thrift::NotRunningError e;
   e.message() = "No session is currently running";
+  return e;
+}
+
+thrift::StreamClientError
+makeStreamClientError(std::string message) {
+  thrift::StreamClientError e;
+  e.message() = std::move(message);
   return e;
 }
 
@@ -256,9 +266,13 @@ void
 ScaleTestServerHandler::sync_getDutCounters(
     std::map<std::string, int64_t>& out,
     std::unique_ptr<std::string> regexFilter) {
+  const auto regex = (regexFilter && !regexFilter->empty())
+      ? *regexFilter
+      : std::string(kDefaultCounterRegex);
   auto snap = snapshot();
   if (!snap) {
-    // Empty map for "not running" — counters are best-effort observability.
+    // Without a session, read the DUT of the stream clients, if any.
+    readStreamClientsDutCounters(out, regex);
     return;
   }
   auto monitor = snap->getDutMonitor();
@@ -269,10 +283,26 @@ ScaleTestServerHandler::sync_getDutCounters(
   if (!monitor) {
     return;
   }
-  out = monitor->getRegexCounters(
-      (regexFilter && !regexFilter->empty())
-          ? *regexFilter
-          : std::string(kDefaultCounterRegex));
+  out = monitor->getRegexCounters(regex);
+}
+
+void
+ScaleTestServerHandler::readStreamClientsDutCounters(
+    std::map<std::string, int64_t>& out, const std::string& regex) {
+  auto clients = streamClients_.rlock();
+  if (!*clients) {
+    // Empty map for "not running" — counters are best-effort observability.
+    return;
+  }
+  auto counters = (*clients)->getDutCounters(regex);
+  if (counters.hasException()) {
+    XLOGF(
+        WARNING,
+        "Cannot read the DUT counters of the stream clients: {}",
+        counters.exception().what());
+    return;
+  }
+  out = std::move(*counters);
 }
 
 void
@@ -291,6 +321,68 @@ ScaleTestServerHandler::sync_verifyRoutes(thrift::RouteCounts& out) {
     throw makeNotRunning();
   }
   out = snap->verifyRoutes();
+}
+
+void
+ScaleTestServerHandler::sync_startStreamClients(
+    std::unique_ptr<thrift::StreamClientsConfig> config) {
+  if (!config->dut()->host().has_value()) {
+    auto snap = snapshot();
+    if (!snap) {
+      throw makeStreamClientError(
+          "StreamClientsConfig.dut.host must be set when no session runs");
+    }
+    config->dut() = *snap->getStatus().activeConfig()->dut();
+  }
+  auto clients = streamClients_.wlock();
+  if (*clients) {
+    thrift::AlreadyRunningError e;
+    e.message() = "Stream clients are running; stopStreamClients first";
+    throw e;
+  }
+  try {
+    *clients = std::make_unique<KvStoreStreamClients>(*config);
+  } catch (const std::invalid_argument& ex) {
+    throw makeStreamClientError(ex.what());
+  }
+}
+
+void
+ScaleTestServerHandler::sync_changeStreamSubscribers(
+    std::unique_ptr<thrift::StreamSubscriberChange> change) {
+  auto clients = streamClients_.rlock();
+  if (!*clients) {
+    throw makeStreamClientError("Stream clients are not running");
+  }
+  try {
+    (*clients)->change(*change);
+  } catch (const std::invalid_argument& ex) {
+    throw makeStreamClientError(ex.what());
+  }
+}
+
+void
+ScaleTestServerHandler::sync_stopStreamClients() {
+  std::unique_ptr<KvStoreStreamClients> stopped;
+  {
+    auto clients = streamClients_.wlock();
+    if (!*clients) {
+      throw makeStreamClientError("Stream clients are not running");
+    }
+    stopped = std::move(*clients);
+  }
+  // The destructor joins the clients outside the lock.
+}
+
+void
+ScaleTestServerHandler::sync_getStreamClientsStats(
+    thrift::StreamClientsStats& out) {
+  auto clients = streamClients_.rlock();
+  if (!*clients) {
+    out.running() = false;
+    return;
+  }
+  out = (*clients)->getStats();
 }
 
 } // namespace openr

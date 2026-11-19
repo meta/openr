@@ -15,6 +15,7 @@
 
 #include <folly/Synchronized.h>
 
+#include <openr/tests/scale/KvStoreStreamClients.h>
 #include <openr/tests/scale/Session.h>
 #include <openr/tests/scale/if/gen-cpp2/ScaleTestServer.h>
 
@@ -70,10 +71,20 @@ class ScaleTestServerHandler
       std::unique_ptr<std::string> regexFilter) override;
   void sync_getNeighborStats(thrift::NeighborStats& out) override;
   void sync_verifyRoutes(thrift::RouteCounts& out) override;
+  void sync_startStreamClients(
+      std::unique_ptr<thrift::StreamClientsConfig> config) override;
+  void sync_changeStreamSubscribers(
+      std::unique_ptr<thrift::StreamSubscriberChange> change) override;
+  void sync_stopStreamClients() override;
+  void sync_getStreamClientsStats(thrift::StreamClientsStats& out) override;
 
  private:
   // Snapshot the current session under rlock, then release.
   std::shared_ptr<Session> snapshot() const;
+
+  // Empty `out` when no stream clients run or the read fails.
+  void readStreamClientsDutCounters(
+      std::map<std::string, int64_t>& out, const std::string& regex);
 
   /*
    * Compute how many ports a session will reserve. Conservative flat
@@ -82,6 +93,8 @@ class ScaleTestServerHandler
   static int portsPerSession();
 
   folly::Synchronized<std::shared_ptr<Session>> session_;
+  // At most one set of stream clients, independent of session_.
+  folly::Synchronized<std::unique_ptr<KvStoreStreamClients>> streamClients_;
   std::atomic<int> nextBasePort_{16300};
 };
 
