@@ -24,6 +24,7 @@ Subcommands:
   counters [regex]        Print DUT counters, optionally filtered by regex.
   neighbor-stats          Print simulated Spark-neighbor stats.
   verify-routes           Print the DUT's computed route counts.
+  stream-*                KvStore stream test clients; see scaletest_stream.py.
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ from openr.tests.scale.ScaleTestServer.thrift_types import (
     LinkRef,
     ScaleTestConfig,
     TopologyConfig,
+)
+from openr.tests.scale.scripts.scaletest_stream import (
+    add_stream_parsers,
+    stream_handlers,
 )
 from thrift.python.client import get_client
 
@@ -331,6 +336,7 @@ def _get_handlers() -> dict[str, Any]:
         "counters": _cmd_counters,
         "neighbor-stats": _cmd_neighbor_stats,
         "verify-routes": _cmd_verify_routes,
+        **stream_handlers(),
     }
 
 
@@ -409,6 +415,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
     sub.add_parser("neighbor-stats", help="Print simulated Spark neighbor stats")
     sub.add_parser("verify-routes", help="Print DUT computed route counts")
+    add_stream_parsers(sub)
 
     return parser.parse_args(argv)
 

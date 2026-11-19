@@ -77,3 +77,64 @@ To remove the ip6tables rules:
 sudo ip6tables -D INPUT  -p tcp --dport 3000:3500 -j ACCEPT
 sudo ip6tables -D OUTPUT -p tcp --sport 3000:3100 -j ACCEPT
 ```
+
+## KvStore Stream Clients
+
+`scaletest stream-*` commands run KvStore stream test clients in
+`scale_test_server_d`. Each subscriber calls `subscribeAndGetAreaKvStores` and
+each poller calls `getKvStoreKeyValsFilteredArea`, on its own connection to the
+DUT control port. The clients target the DUT in their config, or the DUT of the
+active session when the config names none. They run with or without a session,
+next to the session churn (node and link flaps) when one runs. They need no
+running Open/R: a failed connection counts as a CONNECTION end, and the client
+tries again after its reconnect delay.
+
+```bash
+scaletest stream-start --config stream.yaml
+scaletest stream-change --ids 0 --stall
+scaletest stream-stats
+scaletest stream-stop
+```
+
+Example `stream.yaml`. Absent fields keep the defaults of
+`if/ScaleTestServer.thrift`:
+
+```yaml
+dut:                         # optional; default: the session DUT
+  host: "::1"
+  port: 2018
+subscribers:
+  - count: 4
+    keyPrefixes: ["adj:", "prefix:"]
+    areas: ["0"]
+    senderId: "scale-{id}"   # {id} becomes the subscriber id
+    readDelayMs: 0           # delay per message
+    bufferSize: 100          # credits per subscription; 0 = none until the first read
+    reconnectDelayMs: 2000   # negative = wait for stream-change --reconnect
+pollers:
+  - count: 2
+    keyPrefixes: ["adj:"]
+    area: "0"
+    intervalMs: 1000
+    senderId: "poll-{id}"
+```
+
+`stream-stats` prints per subscriber the state, subscriptions, reconnects,
+snapshot bytes, keys and latency, messages, bytes and keys received, and the
+stream end reasons (LOADSHEDDING, OVERFLOW, BUDGET, CREDIT_TIMEOUT, SHUTDOWN,
+CONNECTION, COMPLETED, CLIENT_CANCEL). It also prints the DUT counters that
+match `--counters` (default `^subscribers\.kvstore`).
+
+`stream-scenario <name>` starts the clients, runs one test, prints the stats
+and DUT counters after each phase, and stops the clients. `--dut-host` and
+`--dut-port` name the DUT; without them, the scenario uses the session DUT:
+
+| Scenario  | Test                                                                  |
+| --------- | --------------------------------------------------------------------- |
+| `steady`  | Subscribers and pollers for `--duration`.                             |
+| `restart` | Subscribers across an Open/R restart (`--restart-cmd` or by hand).    |
+| `cold-start` | Subscribers that start before Open/R (`--start-cmd` or by hand).   |
+| `churn`   | Subscribers during flaps of `--links` (`--cycles`, `--interval`). Needs a session. |
+| `stalled` | Subscriber 0 stalls for `--duration`, then resumes.                   |
+| `cap`     | 20 subscribers against the subscriber cap of 16, with no retry.       |
+| `gate`    | 8 stalled subscribers with no buffer hold their snapshot slots against the gate of 4, then resume. |
