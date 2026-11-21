@@ -19,7 +19,7 @@
 #include <folly/Portability.h>
 #include <folly/Try.h>
 #include <folly/container/F14Map.h>
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 #include <folly/coro/safe/NowTask.h>
 #endif
 #include <folly/io/async/AsyncSocket.h>
@@ -268,7 +268,7 @@ KvStoreDumpWithConnectionMeta<ClientType> dumpAllWithThriftClientFromMultiple(
     const std::vector<std::unique_ptr<ClientType>>& clients,
     const KeyPrefixes& keyPrefixes);
 
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 /*
  * Asynchronous interface for fetching multiple prefixes from the store; the
  * underlying client *must* be thread safe as this function does not own
@@ -283,7 +283,7 @@ co_dumpAllWithThriftClientFromMultiple(
     const AreaId& area,
     const std::vector<std::unique_ptr<ClientType>>& clients,
     const KeyPrefixes& keyPrefixes);
-#endif // FOLLY_HAS_IMMOVABLE_COROUTINES
+#endif // FOLLY_HAS_COROUTINES
 
 /*
  * This is the util method to merge the key-values publication to the existing

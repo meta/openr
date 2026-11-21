@@ -8,7 +8,7 @@
 #include <ranges>
 #include <span>
 
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 #include <folly/coro/Collect.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
@@ -275,7 +275,7 @@ dumpAllWithThriftClientFromMultiple(
   return {merged, std::move(failedClients)};
 }
 
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 template <typename ClientType, StringRange KeyPrefixes>
 folly::coro::now_task<KvStoreDumpWithConnectionMeta<ClientType>>
 co_dumpAllWithThriftClientFromMultiple(
@@ -313,6 +313,6 @@ co_dumpAllWithThriftClientFromMultiple(
   co_return KvStoreDumpWithConnectionMeta<ClientType>{
       std::move(merged), std::move(failedClients)};
 }
-#endif // FOLLY_HAS_IMMOVABLE_COROUTINES
+#endif // FOLLY_HAS_COROUTINES
 
 } // namespace openr

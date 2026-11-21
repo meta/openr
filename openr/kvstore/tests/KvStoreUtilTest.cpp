@@ -8,7 +8,7 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/Portability.h>
 #include <folly/Try.h>
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 #include <folly/coro/GtestHelpers.h>
 #endif
 #include <folly/init/Init.h>
@@ -26,7 +26,7 @@ using namespace openr;
 using ::testing::IsFalse;
 using ::testing::IsTrue;
 
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 namespace {
 
 class TestKvStoreClient {
@@ -54,7 +54,7 @@ class TestKvStoreClient {
 };
 
 } // namespace
-#endif // FOLLY_HAS_IMMOVABLE_COROUTINES
+#endif // FOLLY_HAS_COROUTINES
 
 class MultipleKvStoreTestFixture : public ::testing::Test {
  public:
@@ -515,7 +515,7 @@ TEST_F(MultipleKvStoreTestFixture, dumpAllWithClientsTest) {
   }
 }
 
-#if FOLLY_HAS_IMMOVABLE_COROUTINES
+#if FOLLY_HAS_COROUTINES
 CO_TEST(KvStoreUtil, coDumpAllWithClientsMergesResultsAndReportsFailures) {
   const thrift::Value value1 = createThriftValue(1, "node1", "value1");
   const thrift::Value value2 = createThriftValue(1, "node2", "value2");
@@ -561,7 +561,7 @@ CO_TEST(KvStoreUtil, coDumpAllWithClientsMergesResultsAndReportsFailures) {
       kTestingAreaName, filteredClients, prefixes);
   EXPECT_TRUE(filteredClients[0]->keysWereSet());
 }
-#endif // FOLLY_HAS_IMMOVABLE_COROUTINES
+#endif // FOLLY_HAS_COROUTINES
 
 /*
  *
