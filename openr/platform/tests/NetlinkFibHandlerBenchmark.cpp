@@ -18,7 +18,6 @@
 #include <folly/gen/Base.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
-#include <folly/test/TestUtils.h>
 
 #include <openr/platform/NetlinkFibHandler.h>
 #include <openr/tests/mocks/MockNetlinkProtocolSocket.h>
