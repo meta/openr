@@ -921,9 +921,9 @@ TEST(KvStoreStreamRegistryTest, TotalBudgetSparesSharedDefaultSubscribers) {
 }
 
 /*
- * A queue closed at the limit leaves the registry at once and releases its
- * snapshot slot; a slot that tryAdd() reclaimed is not released twice. The
- * handles' later removal changes nothing.
+ * A queue closed at the limit leaves the registry at once and keeps its
+ * snapshot slot until its handle is destroyed; a slot that tryAdd() reclaimed
+ * is not released twice.
  */
 CO_TEST(KvStoreStreamRegistryTest, ClosedQueueLeavesRegistry) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
@@ -958,14 +958,72 @@ CO_TEST(KvStoreStreamRegistryTest, ClosedQueueLeavesRegistry) {
 
   EXPECT_EQ(2, registry->overflowDrops());
   EXPECT_EQ(1, registry->size());
-  EXPECT_EQ(1, registry->snapshotsInFlight());
+  EXPECT_EQ(2, registry->snapshotsInFlight());
   reclaimed.reset();
+  EXPECT_EQ(2, registry->snapshotsInFlight());
   holding.reset();
   EXPECT_EQ(1, registry->size());
   EXPECT_EQ(1, registry->snapshotsInFlight());
   unmatched.reset();
   EXPECT_EQ(0, registry->size());
   EXPECT_EQ(0, registry->snapshotsInFlight());
+}
+
+/*
+ * A queue that a limit closes during the KvStore dump keeps its snapshot slot
+ * while the handler still holds the dump: the gate stays full until the
+ * handle is destroyed.
+ */
+TEST(KvStoreStreamRegistryTest, ClosedQueueKeepsSnapshotSlotUntilHandleEnds) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto limits = kTestLimits;
+  limits.maxSnapshotsInFlight = 1;
+  auto admitted = registry->tryAdd(1, allKeysFilter(), limits);
+  ASSERT_TRUE(admitted.hasValue());
+  std::optional<KvStoreStreamHandle> dumping{std::move(*admitted)};
+  auto tight = limits;
+  tight.maxQueueBytes = 1;
+  registry->fanOut(makePublication({"key1"}), tight);
+  registry->fanOut(makePublication({"key2"}), tight);
+  ASSERT_EQ(1, registry->overflowDrops());
+  ASSERT_EQ(0, registry->size());
+
+  auto rejected = registry->tryAdd(2, allKeysFilter(), limits);
+  ASSERT_TRUE(rejected.hasError());
+  EXPECT_EQ(
+      KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT,
+      rejected.error().reason);
+  EXPECT_EQ(1, registry->snapshotsInFlight());
+
+  dumping.reset();
+  EXPECT_EQ(0, registry->snapshotsInFlight());
+  EXPECT_TRUE(registry->tryAdd(3, allKeysFilter(), limits).hasValue());
+}
+
+// A full gate reclaims the expired slot of a queue that a limit closed.
+TEST(KvStoreStreamRegistryTest, FullGateReclaimsSlotOfClosedQueue) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto limits = kTestLimits;
+  limits.maxSnapshotsInFlight = 1;
+  const auto t0 = std::chrono::steady_clock::now();
+  auto admitted = registry->tryAdd(1, allKeysFilter(), limits, kClient, t0);
+  ASSERT_TRUE(admitted.hasValue());
+  auto tight = limits;
+  tight.maxQueueBytes = 1;
+  registry->fanOut(makePublication({"key1"}), tight);
+  registry->fanOut(makePublication({"key2"}), tight);
+  ASSERT_EQ(0, registry->size());
+
+  auto next = registry->tryAdd(
+      2,
+      allKeysFilter(),
+      limits,
+      kClient,
+      t0 + Constants::kKvStoreStreamSnapshotSlotTimeout);
+
+  EXPECT_TRUE(next.hasValue());
+  EXPECT_EQ(1, registry->snapshotSlotReclaims());
+  EXPECT_EQ(1, registry->snapshotsInFlight());
 }
 
 /*

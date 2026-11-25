@@ -370,13 +370,25 @@ KvStoreStreamRegistry::tryAdd(
        * A client that grants no credit after the first response keeps Thrift
        * from starting its stream; reclaim the slots held that long.
        */
+      const auto expired = [&](const KvStoreStreamSubscriber& other) {
+        return other.holdsSnapshotSlot &&
+            now - other.admissionTime >=
+            Constants::kKvStoreStreamSnapshotSlotTimeout;
+      };
       for (auto& [otherId, other] : state.subscribers) {
-        if (other->holdsSnapshotSlot &&
-            now - other->admissionTime >=
-                Constants::kKvStoreStreamSnapshotSlotTimeout) {
-          other->holdsSnapshotSlot = false;
-          --state.snapshotsInFlight;
+        if (expired(*other)) {
+          releaseSlot(state, *other);
           reclaimed.push_back(otherId);
+        }
+      }
+      for (auto it = state.closedSlotHolders.begin();
+           it != state.closedSlotHolders.end();) {
+        if (expired(*it->second)) {
+          releaseSlot(state, *it->second);
+          reclaimed.push_back(it->first);
+          it = state.closedSlotHolders.erase(it);
+        } else {
+          ++it;
         }
       }
     }
@@ -420,12 +432,31 @@ void
 KvStoreStreamRegistry::releaseSnapshotSlot(int64_t id) {
   state_.withWLock([&](auto& state) {
     auto it = state.subscribers.find(id);
-    if (it == state.subscribers.end() || !it->second->holdsSnapshotSlot) {
+    if (it != state.subscribers.end()) {
+      releaseSlot(state, *it->second);
       return;
     }
-    it->second->holdsSnapshotSlot = false;
-    --state.snapshotsInFlight;
+    releaseClosedSlot(state, id);
   });
+}
+
+void
+KvStoreStreamRegistry::releaseSlot(
+    State& state, KvStoreStreamSubscriber& subscriber) {
+  if (subscriber.holdsSnapshotSlot) {
+    subscriber.holdsSnapshotSlot = false;
+    --state.snapshotsInFlight;
+  }
+}
+
+void
+KvStoreStreamRegistry::releaseClosedSlot(State& state, int64_t id) {
+  auto it = state.closedSlotHolders.find(id);
+  if (it == state.closedSlotHolders.end()) {
+    return;
+  }
+  releaseSlot(state, *it->second);
+  state.closedSlotHolders.erase(it);
 }
 
 bool
@@ -434,9 +465,8 @@ KvStoreStreamRegistry::erase(State& state, int64_t id) {
   if (it == state.subscribers.end()) {
     return false;
   }
-  // A slot that tryAdd() reclaimed no longer counts.
   if (it->second->holdsSnapshotSlot) {
-    --state.snapshotsInFlight;
+    state.closedSlotHolders.emplace(id, it->second);
   }
   /*
    * The gauge drops at once, not at the next check. `slowClients` counts the
@@ -470,6 +500,7 @@ void
 KvStoreStreamRegistry::remove(int64_t id) {
   const bool registered = state_.withWLock([&](auto& state) {
     const bool erased = erase(state, id);
+    releaseClosedSlot(state, id);
     XDCHECK_GT(state.openHandles, 0);
     if (state.openHandles > 0) {
       --state.openHandles;

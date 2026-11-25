@@ -206,7 +206,9 @@ struct KvStoreStreamSubscriber {
 
   /*
    * Guarded by the registry lock. Set from admission until Thrift starts the
-   * stream (the generator's first pull), or until tryAdd() reclaims the slot.
+   * stream (the generator's first pull), until the handle is destroyed, or
+   * until tryAdd() reclaims the slot. A queue that a limit closes keeps its
+   * slot: the handler may still hold its KvStore dump.
    */
   bool holdsSnapshotSlot{true};
   // Guarded by the registry lock. When tryAdd() admitted the subscriber.
@@ -410,10 +412,14 @@ class KvStoreStreamRegistry
   friend class KvStoreStreamHandle;
   struct State;
   /*
-   * Removes the subscriber, its snapshot slot and its slow state; false when
-   * it is gone.
+   * Removes the subscriber and its slow state; false when it is gone. A
+   * snapshot slot that it holds moves to State::closedSlotHolders.
    */
   bool erase(State& state, int64_t id);
+  // Releases the snapshot slot of `subscriber`, if it holds one.
+  void releaseSlot(State& state, KvStoreStreamSubscriber& subscriber);
+  // Releases the slot of a subscriber that erase() removed, if it holds one.
+  void releaseClosedSlot(State& state, int64_t id);
   // Sets the slow streams count and its gauge. Under the registry lock.
   void setSlowClients(State& state, size_t slowClients);
   // Posts `streamsEnded_` once closeAll() ran and no handle is left.
@@ -435,6 +441,12 @@ class KvStoreStreamRegistry
     folly::F14FastMap<int64_t, std::shared_ptr<KvStoreStreamSubscriber>>
         subscribers;
     size_t snapshotsInFlight{0};
+    /*
+     * Subscribers that left `subscribers` with their snapshot slot, until the
+     * handle releases the slot or tryAdd() reclaims it.
+     */
+    folly::F14FastMap<int64_t, std::shared_ptr<KvStoreStreamSubscriber>>
+        closedSlotHolders;
     // Subscribers in the slow state.
     size_t slowClients{0};
     // Set by closeAll().
