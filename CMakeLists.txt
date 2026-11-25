@@ -277,8 +277,6 @@ thrift_add_library(
     OpenrCtrlCpp
   OPTIONS
     json
-    stream
-    server_stream
   DEPENDS
     openr_ctrl_cpp2
     kv_store_cpp2
