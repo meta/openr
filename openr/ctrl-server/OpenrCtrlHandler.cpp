@@ -181,6 +181,11 @@ OpenrCtrlHandler::stop() {
   stopping_ = true;
   completePendingLongPollReqs();
   closeKvStorePublishers();
+  if (isKvStoreStreamLimitsEnabled()) {
+    kvStoreStreams_->closeAll(
+        folly::make_exception_wrapper<std::runtime_error>(
+            "publisher terminated"));
+  }
   closeFibPublishers();
   closeFibDetailSubscribers();
 }
@@ -286,6 +291,9 @@ OpenrCtrlHandler::processPublication(thrift::Publication&& pub) {
       publisher->publish(pub);
     }
   });
+  if (isKvStoreStreamLimitsEnabled()) {
+    kvStoreStreams_->fanOut(pub);
+  }
 
   // check if any of KeyVal has 'adj' update
   bool isAdjChanged = false;
@@ -1171,6 +1179,14 @@ OpenrCtrlHandler::semifuture_getSubscriberInfo(int64_t type) {
                                   this]() mutable {
     std::vector<thrift::StreamSubscriberInfo> subscribers;
     if (type == 0) {
+      /*
+       * Queue streams: total_streamed_msgs counts the messages handed to
+       * Thrift, last_msg_sent_time is the last hand-off (see
+       * KvStoreStreamRegistry::getSubscriberInfo()).
+       */
+      if (isKvStoreStreamLimitsEnabled()) {
+        subscribers = kvStoreStreams_->getSubscriberInfo();
+      }
       kvStorePublishers_.withWLock([&](auto& kvStorePublishers_) {
         for (auto& [id, publisher] : kvStorePublishers_) {
           thrift::StreamSubscriberInfo subscriber;
@@ -1229,6 +1245,17 @@ OpenrCtrlHandler::subscribeKvStoreFilter(
     std::unique_ptr<std::set<std::string>> selectAreas) {
   // Get new client-ID (monotonically increasing)
   auto clientToken = publisherToken_++;
+
+  if (isKvStoreStreamLimitsEnabled()) {
+    XLOGF(
+        INFO,
+        "KvStore stream-{} requested for areas: {}",
+        clientToken,
+        folly::join(", ", *selectAreas));
+    return streamKvStore(kvStoreStreams_->add(
+        clientToken,
+        KvStorePublicationFilter(*selectAreas, std::move(*filter))));
+  }
 
   auto streamAndPublisher =
       apache::thrift::ServerStream<thrift::Publication>::createPublisher(
@@ -1327,6 +1354,18 @@ OpenrCtrlHandler::co_subscribeAndDumpKvStore(
   co_return apache::thrift::ResponseAndServerStream<
       std::vector<thrift::Publication>,
       thrift::Publication>{std::move(*pubs), std::move(stream)};
+}
+
+bool
+OpenrCtrlHandler::isKvStoreStreamLimitsEnabled() const {
+  return config_ && config_->isCtrlThriftServerLimitsEnabled();
+}
+
+folly::coro::AsyncGenerator<thrift::Publication&&>
+OpenrCtrlHandler::streamKvStore(KvStoreStreamHandle handle) {
+  while (true) {
+    co_yield co_await handle.queue().pop();
+  }
 }
 
 apache::thrift::ServerStream<thrift::RouteDatabaseDelta>

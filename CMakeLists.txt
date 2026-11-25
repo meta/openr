@@ -701,7 +701,9 @@ if(BUILD_TESTS)
   openr_add_source_group_test(
     NAME OpenrCtrlServerSourceGroupTest
     SOURCE_GROUP_FILE cmake/modules/CtrlServer.cmake
-    SOURCE_VARIABLES OPENR_CTRL_HANDLER_SOURCES
+    SOURCE_VARIABLES
+      OPENR_KVSTORE_STREAM_REGISTRY_SOURCES
+      OPENR_CTRL_HANDLER_SOURCES
     EXPECTED_SOURCE_COUNT ${OPENR_CTRL_SERVER_EXPECTED_SOURCE_COUNT}
   )
 
@@ -801,6 +803,15 @@ if(BUILD_TESTS)
     LIBRARIES
       openr_ctrl_handler
       openr_kvstore_wrapper
+      openr_test_utils
+    DESTINATION sbin/tests/openr/ctrl-server
+  )
+
+  add_openr_test(KvStoreStreamRegistryTest kvstore_stream_registry_test
+    SOURCES
+      openr/ctrl-server/tests/KvStoreStreamRegistryTest.cpp
+    LIBRARIES
+      openr_kvstore_stream_registry
       openr_test_utils
     DESTINATION sbin/tests/openr/ctrl-server
   )

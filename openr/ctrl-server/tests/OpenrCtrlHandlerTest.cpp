@@ -70,6 +70,7 @@ class OpenrCtrlFixture : public ::testing::Test {
     auto tConfig =
         getBasicOpenrConfig(nodeName_, areaConfig, true /* enableV4 */);
     tConfig.adj_hold_time_s() = kCtrlHandlerTestAdjacencyHoldTime.count();
+    customizeConfig(tConfig);
 
     config = std::make_shared<Config>(tConfig);
 
@@ -225,6 +226,23 @@ class OpenrCtrlFixture : public ::testing::Test {
     return setParams;
   }
 
+  // Fixtures override this to set config knobs before the modules start.
+  virtual void
+  customizeConfig(thrift::OpenrConfig& /* tConfig */) {}
+
+  /*
+   * A key update published after subscriber registration and before the
+   * KvStore dump arrives on the stream. The snapshot does not carry it.
+   */
+  folly::coro::Task<void> checkUpdateBeforeDumpReachesStream();
+
+  // KvStore stream subscribers on either path, whatever the knob.
+  size_t
+  numKvStoreSubscribers() {
+    return handler_->getNumKvStorePublishers() +
+        handler_->getNumKvStoreStreams();
+  }
+
   OpenrCtrlClient&
   getOpenrCtrlClient() {
     if (!thriftServer_) {
@@ -279,6 +297,28 @@ class OpenrCtrlFixture : public ::testing::Test {
   std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> thriftServer_;
   std::unique_ptr<OpenrCtrlClient> thriftClient_;
 };
+
+/*
+ * KvStore stream tests that run on both paths: the parameter is
+ * enable_ctrl_thrift_server_limits (false: KvStorePublisher, true: Open/R-owned
+ * queues).
+ */
+class OpenrCtrlKvStoreStreamFixture : public OpenrCtrlFixture,
+                                      public testing::WithParamInterface<bool> {
+ protected:
+  void
+  customizeConfig(thrift::OpenrConfig& tConfig) override {
+    tConfig.enable_ctrl_thrift_server_limits() = GetParam();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    KvStoreStreamPaths,
+    OpenrCtrlKvStoreStreamFixture,
+    testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+      return info.param ? "Queue" : "Publisher";
+    });
 
 CO_TEST_F(OpenrCtrlFixture, GetMyNodeName) {
   std::string res;
@@ -1199,7 +1239,9 @@ CO_TEST_F(OpenrCtrlFixture, KvStoreApis) {
   }
 }
 
-CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
+CO_TEST_P(
+    OpenrCtrlKvStoreStreamFixture,
+    SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
   thrift::KeyVals kvs({
       {"key1", createThriftValue(1, "node1", std::string("value1"), 30000, 1)},
       {"key11",
@@ -1303,7 +1345,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                       diff, received - *(*pub.keyVals()).at(key).version());
                   received++;
                 });
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         key,
@@ -1341,7 +1383,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1420,8 +1462,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                 });
 
     /* There are two clients */
-    EXPECT_EQ(2, handler_->getNumKvStorePublishers());
-    EXPECT_EQ(2, handler_other->getNumKvStorePublishers());
+    EXPECT_EQ(2, numKvStoreSubscribers());
 
     /* key4 and random_prefix keys are getting added for the first time */
     kvStoreWrapper_->setKey(
@@ -1446,7 +1487,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription_other).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1501,7 +1542,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   received++;
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         key,
@@ -1517,7 +1558,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1576,7 +1617,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         "key333",
@@ -1596,7 +1637,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1661,7 +1702,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         key,
@@ -1685,7 +1726,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1751,7 +1792,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         key,
@@ -1779,7 +1820,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1819,7 +1860,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   received++;
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         key,
@@ -1835,7 +1876,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -1889,7 +1930,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
     kvStoreWrapper_->setKey(
         kSpineAreaId,
         "key1",
@@ -1921,14 +1962,15 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysNoTtlUpdate) {
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
 }
 
-CO_TEST_F(
-    OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithKeysTtlUpdateOption) {
+CO_TEST_P(
+    OpenrCtrlKvStoreStreamFixture,
+    SubscribeAndGetKvStoreFilteredWithKeysTtlUpdateOption) {
   thrift::KeyVals kvs({
       {"key1", createThriftValue(1, "node1", std::string("value1"), 30000, 1)},
       {"key11",
@@ -2025,7 +2067,7 @@ CO_TEST_F(
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
 
     // TTL update
     auto thriftValue2 = value;
@@ -2044,7 +2086,7 @@ CO_TEST_F(
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -2118,7 +2160,7 @@ CO_TEST_F(
                   }
                 });
 
-    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(1, numKvStoreSubscribers());
 
     // TTL update
     auto thriftValue2 = value;
@@ -2146,7 +2188,7 @@ CO_TEST_F(
     co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
     // Wait until publisher is destroyed
-    while (handler_->getNumKvStorePublishers() != 0) {
+    while (numKvStoreSubscribers() != 0) {
       std::this_thread::yield();
     }
   }
@@ -2158,7 +2200,8 @@ CO_TEST_F(
  * Verify both in initial full dump and incremental updates we do not
  * see value.
  */
-CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithoutValue) {
+CO_TEST_P(
+    OpenrCtrlKvStoreStreamFixture, SubscribeAndGetKvStoreFilteredWithoutValue) {
   thrift::KeyVals keyVals;
   keyVals["key1"] =
       createThriftValue(1, "node1", std::string("value1"), 30000, 1);
@@ -2230,7 +2273,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithoutValue) {
                 EXPECT_TRUE(pub.timestamp_ms().has_value());
               });
 
-  EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+  EXPECT_EQ(1, numKvStoreSubscribers());
 
   // Update value and publish to verify incremental update also filters value
   auto thriftValue2 = keyVals[test_key];
@@ -2249,7 +2292,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreFilteredWithoutValue) {
   co_await folly::coro::toTask(std::move(subscription).futureJoin());
 
   // Wait until publisher is destroyed
-  while (handler_->getNumKvStorePublishers() != 0) {
+  while (numKvStoreSubscribers() != 0) {
     std::this_thread::yield();
   }
 }
@@ -2647,7 +2690,7 @@ checkPublications(thrift::Publication& expected, thrift::Publication& actual) {
  * Test Streaming scenario. We inject keys into KvStore and verify that the
  * stream is updated accordingly.
  */
-CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStore) {
+CO_TEST_P(OpenrCtrlKvStoreStreamFixture, SubscribeAndGetKvStore) {
   std::string kNewEntry = "newEntry";
   std::string kEntry1 = "key1";
   std::string kEntry2 = "key2";
@@ -2721,11 +2764,8 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStore) {
   }
 }
 
-/*
- * A key update published after subscriber registration and before the
- * KvStore dump arrives on the stream. The snapshot does not carry it.
- */
-CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
+folly::coro::Task<void>
+OpenrCtrlFixture::checkUpdateBeforeDumpReachesStream() {
   const std::string key{"race-key"};
   const auto value = createThriftValue(1, "node1", std::string("value1"));
   thrift::KeyDumpParams filter;
@@ -2753,7 +2793,7 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
           folly::getKeepAliveToken(executor),
           handler_->co_subscribeAndDumpKvStore(filter, kSpineOnlySet))
           .startInlineUnsafe();
-  const auto numSubscribersBeforeDump = handler_->getNumKvStorePublishers();
+  const auto numSubscribersBeforeDump = numKvStoreSubscribers();
   kvStoreWrapper_->pushToKvStoreUpdatesQueue(kSpineAreaId, {{key, value}});
   releaseKvStoreEvb.post();
   CO_ASSERT_EQ(1, numSubscribersBeforeDump);
@@ -2772,6 +2812,137 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
   auto update = *pub;
   CO_ASSERT_EQ(1, update.keyVals()->count(key));
   EXPECT_EQ(value, update.keyVals()->at(key));
+}
+
+CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
+  co_await checkUpdateBeforeDumpReachesStream();
+}
+
+class OpenrCtrlStreamLimitsFixture : public OpenrCtrlFixture {
+ protected:
+  void
+  customizeConfig(thrift::OpenrConfig& tConfig) override {
+    tConfig.enable_ctrl_thrift_server_limits() = true;
+  }
+};
+
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, UpdateBeforeDumpReachesQueueStream) {
+  co_await checkUpdateBeforeDumpReachesStream();
+  EXPECT_EQ(0, handler_->getNumKvStorePublishers());
+}
+
+/*
+ * With enable_ctrl_thrift_server_limits, subscribeAndGetAreaKvStores serves the
+ * stream from the Open/R-owned queue: the snapshot, then the filtered
+ * updates in KvStore publication order.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAndGetAreaKvStoresFromQueue) {
+  const std::string key1{"key1"};
+  const std::string key2{"key2"};
+  const auto setParams = createKeySetParams(
+      {{key1, createThriftValue(1, "node1", std::string("value1"))}});
+  co_await getOpenrCtrlClient().co_setKvStoreKeyVals(setParams, kSpineAreaId);
+  thrift::KeyDumpParams filter;
+  filter.keys() = {key1, key2};
+
+  auto responseAndStream =
+      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          filter, kSpineOnlySet);
+
+  CO_ASSERT_EQ(1, responseAndStream.response.size());
+  EXPECT_EQ(1, responseAndStream.response.front().keyVals()->count(key1));
+  EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(0, handler_->getNumKvStorePublishers());
+
+  auto gen = std::move(responseAndStream.stream).toAsyncGenerator();
+  const auto value2 = createThriftValue(1, "node1", std::string("value2"));
+  const auto value1 = createThriftValue(2, "node1", std::string("value11"));
+  kvStoreWrapper_->setKey(kSpineAreaId, key2, value2, std::nullopt);
+  kvStoreWrapper_->setKey(kSpineAreaId, key1, value1, std::nullopt);
+  const std::vector<std::pair<std::string, thrift::Value>> expectedUpdates{
+      {key2, value2}, {key1, value1}};
+  for (const auto& [key, value] : expectedUpdates) {
+    auto pub =
+        co_await folly::coro::timeout(gen.next(), kKvStorePublicationTimeout);
+    CO_ASSERT_TRUE(pub.has_value());
+    CO_ASSERT_EQ(1, pub->keyVals()->count(key));
+    EXPECT_EQ(value, pub->keyVals()->at(key));
+  }
+}
+
+// Handler shutdown ends each queue stream with "publisher terminated".
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, StopEndsQueueStreams) {
+  auto responseAndStream =
+      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          thrift::KeyDumpParams{}, kSpineOnlySet);
+  auto gen = std::move(responseAndStream.stream).toAsyncGenerator();
+
+  handler_->stop();
+
+  auto next = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(gen.next(), kKvStorePublicationTimeout));
+  CO_ASSERT_TRUE(next.hasException());
+  EXPECT_THAT(
+      next.exception().what().toStdString(),
+      testing::HasSubstr("publisher terminated"));
+}
+
+// A client cancel ends the queue stream and removes its subscriber.
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, CancelRemovesQueueStream) {
+  auto responseAndStream =
+      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          thrift::KeyDumpParams{}, kSpineOnlySet);
+  auto subscription =
+      std::move(responseAndStream.stream)
+          .subscribeExTry(folly::getEventBaseKeepAlive(), [](auto&&) {});
+  EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+
+  subscription.cancel();
+  co_await folly::coro::toTask(std::move(subscription).futureJoin());
+
+  // The server ends the generator on a Thrift thread.
+  while (handler_->getNumKvStoreStreams() != 0) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(0, handler_->getNumKvStorePublishers());
+}
+
+/*
+ * A registered queue stream that the handler never returns, as when the
+ * KvStore dump throws after registration, removes its subscriber when the
+ * stream is destroyed. The dump does not fail on an unknown area (it skips
+ * it), so the test drops the stream that subscribeKvStoreFilter() returns.
+ */
+TEST_F(OpenrCtrlStreamLimitsFixture, UnreturnedQueueStreamRemovesSubscriber) {
+  {
+    auto stream = handler_->subscribeKvStoreFilter(
+        std::make_unique<thrift::KeyDumpParams>(),
+        std::make_unique<std::set<std::string>>(kSpineOnlySet));
+    EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+  }
+  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+}
+
+/*
+ * A subscription that arrives after stop() still gets its snapshot; its
+ * stream ends at once with "publisher terminated" and registers nothing.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAfterStopEndsQueueStream) {
+  handler_->stop();
+
+  auto responseAndStream =
+      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          thrift::KeyDumpParams{}, kSpineOnlySet);
+  EXPECT_EQ(1, responseAndStream.response.size());
+  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  auto gen = std::move(responseAndStream.stream).toAsyncGenerator();
+
+  auto next = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(gen.next(), kKvStorePublicationTimeout));
+  CO_ASSERT_TRUE(next.hasException());
+  EXPECT_THAT(
+      next.exception().what().toStdString(),
+      testing::HasSubstr("publisher terminated"));
 }
 
 /*

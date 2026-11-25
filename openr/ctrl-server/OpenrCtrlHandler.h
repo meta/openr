@@ -11,9 +11,11 @@
 
 #include <fb303/BaseService.h>
 #include <folly/container/F14Map.h>
+#include <folly/coro/AsyncGenerator.h>
 #include <openr/common/Types.h>
 #include <openr/config-store/PersistentStore.h>
 #include <openr/config/Config.h>
+#include <openr/ctrl-server/KvStoreStreamRegistry.h>
 #include <openr/decision/Decision.h>
 #include <openr/dispatcher/Dispatcher.h>
 #include <openr/fib/Fib.h>
@@ -610,6 +612,11 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   }
 
   inline size_t
+  getNumKvStoreStreams() {
+    return kvStoreStreams_->size();
+  }
+
+  inline size_t
   getNumPendingLongPollReqs() {
     return longPollReqs_->size();
   }
@@ -668,6 +675,16 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   co_subscribeAndDumpKvStoreHelper(thrift::KeyDumpParams filter);
 
   void processPublication(thrift::Publication&& pub);
+
+  // enable_ctrl_thrift_server_limits; false without a Config.
+  bool isKvStoreStreamLimitsEnabled() const;
+
+  /*
+   * Stream of one subscriber on the Open/R-owned queue. The frame owns
+   * `handle`; its destructor removes the subscriber.
+   */
+  static folly::coro::AsyncGenerator<thrift::Publication&&> streamKvStore(
+      KvStoreStreamHandle handle);
   void authorizeConnection();
   void closeKvStorePublishers();
   void closeFibPublishers();
@@ -697,6 +714,10 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   folly::Synchronized<
       folly::F14FastMap<int64_t, std::unique_ptr<KvStorePublisher>>>
       kvStorePublishers_;
+
+  // Open/R-owned KvStore stream queues (enable_ctrl_thrift_server_limits)
+  const std::shared_ptr<KvStoreStreamRegistry> kvStoreStreams_{
+      std::make_shared<KvStoreStreamRegistry>()};
 
   // Active Fib streaming publishers
   folly::Synchronized<folly::F14FastMap<

@@ -37,6 +37,21 @@ KvStorePublicationFilter::computeKeepsAllKeys(
 }
 
 bool
+KvStorePublicationFilter::sameKeyFilter(
+    const KvStorePublicationFilter& other) const {
+  if (keepsAllKeys_ || other.keepsAllKeys_) {
+    return keepsAllKeys_ == other.keepsAllKeys_;
+  }
+  // Every field that apply() reads; KvStoreFilters defaults oper to OR.
+  return *filter_.keys() == *other.filter_.keys() &&
+      *filter_.originatorIds() == *other.filter_.originatorIds() &&
+      filter_.oper().value_or(thrift::FilterOperator::OR) ==
+      other.filter_.oper().value_or(thrift::FilterOperator::OR) &&
+      *filter_.ignoreTtl() == *other.filter_.ignoreTtl() &&
+      *filter_.doNotPublishValue() == *other.filter_.doNotPublishValue();
+}
+
+bool
 KvStorePublicationFilter::matchesArea(const std::string& area) const {
   return selectAreas_.empty() || selectAreas_.count(area);
 }

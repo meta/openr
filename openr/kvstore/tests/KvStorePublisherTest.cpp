@@ -6,6 +6,7 @@
  */
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -158,6 +159,89 @@ TEST(KvStorePublicationFilter, MatchesArea) {
   const KvStorePublicationFilter spine({"spine"}, thrift::KeyDumpParams{});
   EXPECT_TRUE(spine.matchesArea("spine"));
   EXPECT_FALSE(spine.matchesArea("plane"));
+}
+
+TEST(KvStorePublicationFilter, SameKeyFilter) {
+  struct TestCase {
+    std::string name;
+    std::set<std::string> otherAreas;
+    thrift::KeyDumpParams other;
+    bool expected;
+  };
+  // Every case compares against keys {"adj:"} in area "spine".
+  const auto base = createKeyParams({"adj:"});
+  std::vector<TestCase> testCases;
+  testCases.push_back({"same params", {"spine"}, base, true});
+  testCases.push_back({"other area", {"pod"}, base, true});
+  testCases.push_back(
+      {"other keys", {"spine"}, createKeyParams({"prefix:"}), false});
+  {
+    auto params = base;
+    params.originatorIds() = std::set<std::string>{"node1"};
+    testCases.push_back({"originatorIds", {"spine"}, std::move(params), false});
+  }
+  {
+    auto params = base;
+    params.oper() = thrift::FilterOperator::AND;
+    testCases.push_back({"oper AND", {"spine"}, std::move(params), false});
+  }
+  {
+    // KvStoreFilters treats an unset oper as OR.
+    auto params = base;
+    params.oper() = thrift::FilterOperator::OR;
+    testCases.push_back({"oper OR", {"spine"}, std::move(params), true});
+  }
+  {
+    auto params = base;
+    params.ignoreTtl() = false;
+    testCases.push_back({"ignoreTtl", {"spine"}, std::move(params), false});
+  }
+  {
+    auto params = base;
+    params.doNotPublishValue() = true;
+    testCases.push_back(
+        {"doNotPublishValue", {"spine"}, std::move(params), false});
+  }
+  {
+    // Fields that apply() does not read.
+    auto params = base;
+    params.senderId() = "node2";
+    params.keyValHashes() = thrift::KeyVals{};
+    testCases.push_back(
+        {"senderId and keyValHashes", {"spine"}, std::move(params), true});
+  }
+  testCases.push_back(
+      {"keeps all keys", {"spine"}, createUnfilteredParams(), false});
+
+  const KvStorePublicationFilter filter({"spine"}, base);
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(testCase.name);
+    const KvStorePublicationFilter other(testCase.otherAreas, testCase.other);
+    EXPECT_EQ(testCase.expected, filter.sameKeyFilter(other));
+    EXPECT_EQ(testCase.expected, other.sameKeyFilter(filter));
+  }
+}
+
+/*
+ * Filters that keep all keys are the same key filter whatever their oper;
+ * apply() is never used for them.
+ */
+TEST(KvStorePublicationFilter, SameKeyFilterKeepsAllKeys) {
+  auto andParams = createUnfilteredParams();
+  andParams.oper() = thrift::FilterOperator::AND;
+  const KvStorePublicationFilter all1({"spine"}, createUnfilteredParams());
+  const KvStorePublicationFilter all2({} /* selectAreas */, andParams);
+  const KvStorePublicationFilter defaultParams(
+      {"spine"}, thrift::KeyDumpParams{});
+  ASSERT_TRUE(all1.keepsAllKeys());
+  ASSERT_TRUE(all2.keepsAllKeys());
+  ASSERT_FALSE(defaultParams.keepsAllKeys());
+
+  EXPECT_TRUE(all1.sameKeyFilter(all2));
+  EXPECT_FALSE(all1.sameKeyFilter(defaultParams));
+  EXPECT_FALSE(defaultParams.sameKeyFilter(all1));
+  EXPECT_TRUE(defaultParams.sameKeyFilter(
+      KvStorePublicationFilter({"pod"}, thrift::KeyDumpParams{})));
 }
 
 TEST(KvStorePublicationFilter, Apply) {

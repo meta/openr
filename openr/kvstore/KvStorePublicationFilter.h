@@ -52,6 +52,15 @@ class KvStorePublicationFilter {
   std::optional<thrift::Publication> apply(
       const thrift::Publication& pub) const;
 
+  /*
+   * True when both filters keep the same keys of every publication: both keep
+   * all keys, or apply() returns the same result for both. Their subscribers
+   * can share one filtered copy. The areas are not compared; callers check
+   * matchesArea() per subscriber. Example: keys {"prefix:"} in area "spine"
+   * and keys {"prefix:"} in area "pod" are the same key filter.
+   */
+  bool sameKeyFilter(const KvStorePublicationFilter& other) const;
+
  private:
   static bool computeKeepsAllKeys(const thrift::KeyDumpParams& filter);
 
