@@ -788,6 +788,8 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
           .maxSubscribers = Constants::kKvStoreStreamMaxSubscribers,
           .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
           .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes,
+          .mergeBytes = Constants::kKvStoreStreamMergeBytes,
+          .mergeExitBytes = Constants::kKvStoreStreamMergeExitBytes,
           .slowClientBytes = Constants::kKvStoreStreamSlowClientBytes,
           .slowClientDuration = Constants::kKvStoreStreamSlowClientDuration}};
   /*

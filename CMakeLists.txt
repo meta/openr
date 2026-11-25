@@ -702,6 +702,7 @@ if(BUILD_TESTS)
     NAME OpenrCtrlServerSourceGroupTest
     SOURCE_GROUP_FILE cmake/modules/CtrlServer.cmake
     SOURCE_VARIABLES
+      OPENR_KVSTORE_STREAM_MERGE_BUFFER_SOURCES
       OPENR_KVSTORE_STREAM_REGISTRY_SOURCES
       OPENR_CTRL_HANDLER_SOURCES
     EXPECTED_SOURCE_COUNT ${OPENR_CTRL_SERVER_EXPECTED_SOURCE_COUNT}
@@ -812,8 +813,20 @@ if(BUILD_TESTS)
       openr/ctrl-server/tests/KvStoreStreamRegistryTest.cpp
     LIBRARIES
       openr_kvstore_stream_registry
+      openr_kvstore_util
       openr_test_utils
       fb303::fb303
+    DESTINATION sbin/tests/openr/ctrl-server
+  )
+
+  add_openr_test(KvStoreStreamMergeBufferTest kvstore_stream_merge_buffer_test
+    SOURCES
+      openr/ctrl-server/tests/KvStoreStreamMergeBufferTest.cpp
+    LIBRARIES
+      openr_kvstore_stream_merge_buffer
+      openr_constants
+      openr_util
+      openr_test_utils
     DESTINATION sbin/tests/openr/ctrl-server
   )
 

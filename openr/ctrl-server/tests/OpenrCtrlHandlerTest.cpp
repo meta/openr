@@ -2859,6 +2859,8 @@ class OpenrCtrlStreamLimitsFixture : public OpenrCtrlFixture {
         .maxSubscribers = maxSubscribers,
         .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
         .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes,
+        .mergeBytes = Constants::kKvStoreStreamMergeBytes,
+        .mergeExitBytes = Constants::kKvStoreStreamMergeExitBytes,
         .slowClientBytes = Constants::kKvStoreStreamSlowClientBytes,
         .slowClientDuration = Constants::kKvStoreStreamSlowClientDuration};
   }

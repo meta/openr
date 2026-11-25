@@ -448,7 +448,11 @@ class Constants {
   /*
    * KvStore stream memory, applied with enable_ctrl_thrift_server_limits.
    * Bytes are the Compact serialized size of the messages; the in-memory
-   * Publications (map nodes, strings) are larger.
+   * Publications (map nodes, strings) are larger. A merged entry (merge mode,
+   * below) counts its key plus its Compact serialized Value, or plus 8 for
+   * an expiry: the per-stream limit and the merge thresholds compare these
+   * serialized bytes in both modes. The total budget also counts
+   * kKvStoreStreamMergedEntryOverheadBytes per merged entry.
    *
    * Per stream: when a queue that holds messages would exceed this, Open/R
    * closes the stream and frees its queue. An empty queue accepts a message
@@ -470,6 +474,33 @@ class Constants {
    * only with enable_ctrl_thrift_server_limits.
    */
   static constexpr size_t kKvStoreStreamTotalMaxBytes{256 * 1024 * 1024};
+  /*
+   * Merge mode: at this many queued bytes, a stream queue keeps the latest
+   * value of each key and the expiry of each expired key. A value never
+   * replaces a queued expiry: the expiry is sent first. Below the exit value,
+   * checked after each pop, the queue returns to KvStore publication order.
+   * The entry value waits for measurements of the update rate.
+   */
+  static constexpr size_t kKvStoreStreamMergeBytes{8 * 1024 * 1024};
+  static constexpr size_t kKvStoreStreamMergeExitBytes{4 * 1024 * 1024};
+  /*
+   * A pop in merge mode moves merged entries out until the next one would
+   * take their total-budget bytes (overhead included) above this, taking at
+   * least one entry. So a pop releases at most about this much from the
+   * budget while Thrift still holds it.
+   */
+  static constexpr size_t kKvStoreStreamMergedPopMaxBytes{1024 * 1024};
+  /*
+   * Estimated memory of one merged entry on top of its key and serialized
+   * Value: the map slot (key string, optional Value, byte count), the hash
+   * index and allocator slack. Counted only toward the total budget, not the
+   * per-stream limit or the merge thresholds: folding values never raises a
+   * queue's per-stream bytes above its serialized messages, and an expiry
+   * counts at most 7 bytes more than in its Publication. Example: a 40-byte
+   * key with a 200-byte serialized Value counts 240 bytes per stream and
+   * 40 + 200 + 256 bytes in the total budget.
+   */
+  static constexpr size_t kKvStoreStreamMergedEntryOverheadBytes{256};
   /*
    * Slow-client alert: a stream whose queue holds at least this many bytes
    * (half of the per-stream limit) at every check for the duration, while

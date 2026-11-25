@@ -4,6 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 
 # Sources owned by the Buck targets in openr/ctrl-server.
+set(OPENR_KVSTORE_STREAM_MERGE_BUFFER_SOURCES
+  openr/ctrl-server/KvStoreStreamMergeBuffer.cpp
+)
 set(OPENR_KVSTORE_STREAM_REGISTRY_SOURCES
   openr/ctrl-server/KvStoreStreamRegistry.cpp
 )
@@ -11,12 +14,26 @@ set(OPENR_CTRL_HANDLER_SOURCES
   openr/ctrl-server/OpenrCtrlHandler.cpp
 )
 
-set(OPENR_CTRL_SERVER_EXPECTED_SOURCE_COUNT 2)
+set(OPENR_CTRL_SERVER_EXPECTED_SOURCE_COUNT 3)
 
 # Create the Thrift control-plane handler after all module implementations
 # it dispatches to are available. The broad public dependency surface
 # follows the module pointers and generated service bases in its header.
 macro(openr_add_ctrl_server_library)
+  # Buck2 target: //openr/ctrl-server:kvstore-stream-merge-buffer
+  openr_add_library(
+    NAME openr_kvstore_stream_merge_buffer
+    SOURCES ${OPENR_KVSTORE_STREAM_MERGE_BUFFER_SOURCES}
+    PRIVATE_DEPENDENCIES
+      openr_constants
+    PUBLIC_DEPENDENCIES
+      kv_store_cpp2
+      Folly::folly
+      thrift::rpc
+  )
+  add_library(OpenR::kvstore_stream_merge_buffer
+    ALIAS openr_kvstore_stream_merge_buffer)
+
   # Buck2 target: //openr/ctrl-server:kvstore-stream-registry
   openr_add_library(
     NAME openr_kvstore_stream_registry
@@ -26,6 +43,7 @@ macro(openr_add_ctrl_server_library)
       openr_constants
       openr_util
     PUBLIC_DEPENDENCIES
+      openr_kvstore_stream_merge_buffer
       openr_kvstore_publication_filter
       openr_ctrl_cpp2
       kv_store_cpp2

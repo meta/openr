@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -42,10 +43,14 @@ constexpr std::string_view kSlowClientEventsStat{
 constexpr std::string_view kMaxOccupancyCounter{
     "subscribers.kvstore.queue_occupancy_pct_max"};
 
+constexpr std::string_view kMergeModeEntriesStat{
+    "subscribers.kvstore.merge_mode_entries"};
+
+template <typename T>
 size_t
-serializedSize(const thrift::Publication& pub) {
+serializedSize(const T& object) {
   apache::thrift::CompactProtocolWriter writer;
-  return pub.serializedSizeZC(&writer);
+  return object.serializedSizeZC(&writer);
 }
 
 /*
@@ -77,54 +82,129 @@ struct ChargedPublication {
 
 } // namespace
 
+KvStoreStreamQueue::KvStoreStreamQueue(
+    std::shared_ptr<std::atomic<size_t>> referencedBytes)
+    : state_(std::in_place, std::move(referencedBytes)) {}
+
 KvStoreStreamQueue::PushResult
-KvStoreStreamQueue::push(KvStoreStreamMessage message, size_t maxBytes) {
+KvStoreStreamQueue::push(
+    KvStoreStreamMessage message, const KvStoreStreamLimits& limits) {
   auto result = PushResult::QUEUED;
+  // Whether this push added an item for pop(): it then adds a token.
+  bool added{false};
   // Destroyed after the lock is released: freeing Publications takes time.
   std::deque<KvStoreStreamMessage> dropped;
+  std::optional<KvStoreStreamMergeBuffer> droppedMerged;
+  std::deque<KvStoreStreamMessage> folded;
   {
     auto state = state_.wlock();
     if (state->closeReason) {
       return PushResult::CLOSED;
     }
     /*
-     * An empty queue accepts any message: its client is not behind, and the
-     * total budget bounds the memory.
+     * An empty queue accepts any message as it is, without entering merge
+     * mode: its client is not behind, and the total budget bounds the memory.
      */
-    if (!state->messages.empty() && state->bytes + message.bytes > maxBytes) {
+    const bool empty = state->messages.empty() && state->merged.empty();
+    if (!empty && !state->merging &&
+        state->bytes() + message.bytes >= limits.mergeBytes) {
+      folded = enterMergeMode(*state, limits.mergeExitBytes);
+    }
+    bool overflow{false};
+    if (state->merging) {
+      added = state->merged.add(*message.publication) || added;
+      overflow = !empty && state->bytes() > limits.maxQueueBytes;
+    } else {
+      overflow =
+          !empty && state->bytes() + message.bytes > limits.maxQueueBytes;
+    }
+    if (overflow) {
       state->closeReason =
           folly::make_exception_wrapper<std::runtime_error>(fmt::format(
-              "KvStore stream queue limit of {} bytes exceeded", maxBytes));
+              "KvStore stream queue limit of {} bytes exceeded",
+              limits.maxQueueBytes));
       dropped.swap(state->messages);
-      state->bytes = 0;
+      state->messageBytes = 0;
+      // Releases the merged bytes when destroyed.
+      droppedMerged.emplace(std::move(state->merged));
       result = PushResult::OVERFLOW;
-    } else {
-      state->bytes += message.bytes;
+      // The close token.
+      added = true;
+    } else if (!state->merging) {
+      state->messageBytes += message.bytes;
       state->messages.push_back(std::move(message));
+      added = true;
     }
   }
-  available_.signal();
+  /*
+   * The lock is released: `folded`, `dropped` and `droppedMerged` free their
+   * Publications at return, without blocking fanOut() or pop().
+   */
+  if (added) {
+    available_.signal();
+  }
   return result;
+}
+
+std::deque<KvStoreStreamMessage>
+KvStoreStreamQueue::enterMergeMode(State& state, size_t mergeExitBytes) {
+  state.merging = true;
+  state.mergeExitBytes = mergeExitBytes;
+  /*
+   * Each message starts at most one segment, so the tokens of the messages
+   * cover the segments; the rest are surplus.
+   */
+  for (const auto& message : state.messages) {
+    std::ignore = state.merged.add(*message.publication);
+  }
+  std::deque<KvStoreStreamMessage> folded;
+  folded.swap(state.messages);
+  state.messageBytes = 0;
+  facebook::fb303::fbData->addStatValue(
+      kMergeModeEntriesStat, 1, facebook::fb303::COUNT);
+  return folded;
 }
 
 folly::coro::Task<thrift::Publication>
 KvStoreStreamQueue::pop() {
   while (true) {
     co_await available_.co_wait();
+    std::optional<thrift::Publication> mergedPub;
+    // A segment that keeps entries after its chunk keeps its token.
+    bool segmentLeft{false};
     KvStoreStreamMessage message;
     {
       auto state = state_.wlock();
       if (state->closeReason) {
         state->closeReason.throw_exception();
       }
-      if (state->messages.empty()) {
+      if (!state->merged.empty()) {
+        const auto segments = state->merged.segments();
+        mergedPub =
+            state->merged.pop(Constants::kKvStoreStreamMergedPopMaxBytes);
+        segmentLeft = state->merged.segments() == segments;
+        if (state->merging && state->bytes() < state->mergeExitBytes) {
+          state->merging = false;
+        }
+      } else if (!state->messages.empty()) {
+        message = std::move(state->messages.front());
+        state->messages.pop_front();
+        state->messageBytes -= message.bytes;
+      } else {
+        // Surplus tokens of folded messages; see `available_`.
+        while (available_.try_wait()) {
+        }
         continue;
       }
-      message = std::move(state->messages.front());
-      state->messages.pop_front();
-      state->bytes -= message.bytes;
       ++state->sentMessages;
       state->lastSendTime = std::chrono::system_clock::now();
+    }
+    if (mergedPub) {
+      if (segmentLeft) {
+        available_.signal();
+      }
+      mergedPub->timestamp_ms() = getUnixTimeStampMs();
+      co_return std::move(*mergedPub);
     }
     /*
      * Other queues of a shared message may read the Publication on other
@@ -144,6 +224,7 @@ void
 KvStoreStreamQueue::close(folly::exception_wrapper reason) {
   // Destroyed after the lock is released: freeing Publications takes time.
   std::deque<KvStoreStreamMessage> dropped;
+  std::optional<KvStoreStreamMergeBuffer> droppedMerged;
   {
     auto state = state_.wlock();
     if (state->closeReason) {
@@ -151,19 +232,27 @@ KvStoreStreamQueue::close(folly::exception_wrapper reason) {
     }
     state->closeReason = std::move(reason);
     dropped.swap(state->messages);
-    state->bytes = 0;
+    state->messageBytes = 0;
+    // Releases the merged bytes when destroyed.
+    droppedMerged.emplace(std::move(state->merged));
   }
   available_.signal();
 }
 
 size_t
 KvStoreStreamQueue::queuedBytes() const {
-  return state_.rlock()->bytes;
+  return state_.rlock()->bytes();
 }
 
 size_t
 KvStoreStreamQueue::queuedMessages() const {
-  return state_.rlock()->messages.size();
+  auto state = state_.rlock();
+  return state->messages.size() + state->merged.segments();
+}
+
+bool
+KvStoreStreamQueue::isMerging() const {
+  return state_.rlock()->merging;
 }
 
 bool
@@ -174,10 +263,16 @@ KvStoreStreamQueue::isClosed() const {
 size_t
 KvStoreStreamQueue::evictableBytes() const {
   auto state = state_.rlock();
-  if (state->messages.size() <= 1) {
+  /*
+   * A queue in merge mode holds the updates of several publications: it is
+   * behind. Its merged entries belong to it alone; closing it frees their
+   * budget bytes, the per-entry overhead included.
+   */
+  if (!state->merging &&
+      state->messages.size() + state->merged.segments() <= 1) {
     return 0;
   }
-  size_t bytes{0};
+  size_t bytes{state->merged.budgetBytes()};
   for (const auto& message : state->messages) {
     /*
      * use_count() only ranks queues here; nothing reads or moves the
@@ -211,11 +306,15 @@ KvStoreStreamQueue::frontPublicationForTest() const {
 }
 
 KvStoreStreamSubscriber::KvStoreStreamSubscriber(
-    int64_t id, KvStorePublicationFilter filter, std::string client)
+    int64_t id,
+    KvStorePublicationFilter filter,
+    std::string client,
+    std::shared_ptr<std::atomic<size_t>> referencedBytes)
     : id(id),
       filter(std::move(filter)),
       client(std::move(client)),
-      subscriptionTime(std::chrono::steady_clock::now()) {}
+      subscriptionTime(std::chrono::steady_clock::now()),
+      queue(std::move(referencedBytes)) {}
 
 KvStoreStreamHandle::KvStoreStreamHandle(
     std::weak_ptr<KvStoreStreamRegistry> registry,
@@ -249,7 +348,7 @@ KvStoreStreamRegistry::tryAdd(
     std::string client,
     std::chrono::steady_clock::time_point now) {
   auto subscriber = std::make_shared<KvStoreStreamSubscriber>(
-      id, std::move(filter), std::move(client));
+      id, std::move(filter), std::move(client), referencedBytes_);
   enum class Admission { ADMITTED, CLOSED, REJECTED };
   KvStoreStreamRejection rejection;
   std::vector<int64_t> reclaimed;
@@ -443,7 +542,7 @@ KvStoreStreamRegistry::fanOut(
   std::vector<int64_t> overflowed;
   const auto push = [&](KvStoreStreamSubscriber& member,
                         KvStoreStreamMessage message) {
-    if (member.queue.push(std::move(message), limits.maxQueueBytes) ==
+    if (member.queue.push(std::move(message), limits) ==
         KvStoreStreamQueue::PushResult::OVERFLOW) {
       overflowed.push_back(member.id);
     }

@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <fmt/format.h>
 #include <folly/CancellationToken.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/GtestHelpers.h>
@@ -21,12 +22,14 @@
 #include <folly/synchronization/Baton.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include <fb303/ServiceData.h>
 
 #include <openr/common/Constants.h>
 #include <openr/common/Util.h>
 #include <openr/ctrl-server/KvStoreStreamRegistry.h>
+#include <openr/kvstore/KvStoreUtil.h>
 
 namespace openr {
 
@@ -61,6 +64,19 @@ keysFilter(std::vector<std::string> keys) {
   return KvStorePublicationFilter({kArea}, std::move(params));
 }
 
+thrift::Publication
+makeUpdate(
+    const std::vector<std::pair<std::string, std::string>>& keyValues,
+    const std::vector<std::string>& expiredKeys = {}) {
+  thrift::Publication pub;
+  pub.area() = kArea;
+  for (const auto& [key, value] : keyValues) {
+    pub.keyVals()->emplace(key, createThriftValue(1, "node1", value));
+  }
+  pub.expiredKeys() = expiredKeys;
+  return pub;
+}
+
 std::set<std::string>
 keysOf(const thrift::Publication& pub) {
   std::set<std::string> keys;
@@ -68,6 +84,35 @@ keysOf(const thrift::Publication& pub) {
     keys.insert(key);
   }
   return keys;
+}
+
+thrift::Publication
+makeVersioned(const std::string& key, int64_t version) {
+  thrift::Publication pub;
+  pub.area() = kArea;
+  pub.keyVals()->emplace(
+      key, createThriftValue(version, "node1", std::string("value")));
+  return pub;
+}
+
+size_t
+serializedSize(const thrift::Publication& pub) {
+  return apache::thrift::CompactSerializer::serialize<std::string>(pub).size();
+}
+
+constexpr size_t kOverhead{Constants::kKvStoreStreamMergedEntryOverheadBytes};
+
+/*
+ * Applies `pub` the way stream clients such as KvStoreSnooper and
+ * KvStoreUtil's dumpAllWithStreaming do: expired keys leave, and values merge
+ * through mergeKeyValues(), which rejects a lower version of a key it holds.
+ */
+void
+applyLikeClient(thrift::KeyVals& keyVals, const thrift::Publication& pub) {
+  for (const auto& key : *pub.expiredKeys()) {
+    keyVals.erase(key);
+  }
+  mergeKeyValues(keyVals, *pub.keyVals());
 }
 
 /*
@@ -79,8 +124,19 @@ constexpr KvStoreStreamLimits kTestLimits{
     .maxSubscribers = 100,
     .maxQueueBytes = 1024 * 1024,
     .maxTotalBytes = 1024 * 1024,
+    .mergeBytes = std::numeric_limits<size_t>::max(),
+    .mergeExitBytes = 0,
     .slowClientBytes = std::numeric_limits<size_t>::max(),
     .slowClientDuration = std::chrono::seconds(300)};
+
+// Merge mode from the first queued byte; exit below 1 byte.
+KvStoreStreamLimits
+mergeLimits() {
+  auto limits = kTestLimits;
+  limits.mergeBytes = 1;
+  limits.mergeExitBytes = 1;
+  return limits;
+}
 
 /*
  * Any queued message reaches the slow-client threshold; only an empty queue
@@ -1201,6 +1257,522 @@ TEST(KvStoreStreamRegistryTest, CheckRefreshesGauges) {
       registry->referencedBytes(),
       facebook::fb303::fbData->getCounter("subscribers.kvstore.queued_bytes"));
   EXPECT_EQ(0, slowClientsGauge());
+}
+
+/*
+ * In merge mode, the queue keeps the latest value of each key and the expiry
+ * of each expired key. A value that meets a queued expiry (key3) starts a
+ * second Publication, so the expiry is sent first.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeKeepsLatestValuePerKey) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = mergeLimits();
+
+  registry->fanOut(makeUpdate({{"key1", "v1"}, {"key2", "v1"}}), limits);
+  registry->fanOut(makeUpdate({{"key1", "v2"}}, {"key3"}), limits);
+  registry->fanOut(makeUpdate({{"key3", "v1"}}, {"key2"}), limits);
+
+  EXPECT_EQ(2, handle.queue().queuedMessages());
+  const auto first = co_await handle.queue().pop();
+  CO_ASSERT_EQ(2, first.keyVals()->size());
+  EXPECT_EQ("v2", *first.keyVals()->at("key1").value());
+  EXPECT_EQ("v1", *first.keyVals()->at("key2").value());
+  EXPECT_EQ(std::vector<std::string>{"key3"}, *first.expiredKeys());
+  const auto second = co_await handle.queue().pop();
+  CO_ASSERT_EQ(1, second.keyVals()->size());
+  EXPECT_EQ("v1", *second.keyVals()->at("key3").value());
+  EXPECT_EQ(std::vector<std::string>{"key2"}, *second.expiredKeys());
+  EXPECT_EQ(0, handle.queue().queuedBytes());
+}
+
+/*
+ * Merged entries charge the total budget, with the overhead of each entry,
+ * and release it at pop. The second update enters merge mode: an empty
+ * queue takes the first one as it is.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergedBytesChargeBudget) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
+
+  CO_ASSERT_EQ(1, handle.queue().queuedMessages());
+  EXPECT_GT(handle.queue().queuedBytes(), 0);
+  EXPECT_EQ(
+      handle.queue().queuedBytes() + 2 * kOverhead,
+      registry->referencedBytes());
+  co_await handle.queue().pop();
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+// Below the exit value, the queue returns to publication order.
+CO_TEST(KvStoreStreamRegistryTest, MergeExitRestoresPublicationOrder) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  CO_ASSERT_EQ(1, handle.queue().queuedMessages());
+  co_await handle.queue().pop();
+
+  registry->fanOut(makeUpdate({{"key1", "v2"}}), kTestLimits);
+  registry->fanOut(makeUpdate({{"key1", "v3"}}), kTestLimits);
+
+  EXPECT_EQ(2, handle.queue().queuedMessages());
+  const auto first = co_await handle.queue().pop();
+  const auto second = co_await handle.queue().pop();
+  EXPECT_EQ("v2", *first.keyVals()->at("key1").value());
+  EXPECT_EQ("v3", *second.keyVals()->at("key1").value());
+}
+
+// Closing a queue in merge mode releases its merged bytes.
+TEST(KvStoreStreamRegistryTest, CloseReleasesMergedBytes) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
+  ASSERT_EQ(1, handle.queue().queuedMessages());
+  ASSERT_EQ(
+      handle.queue().queuedBytes() + 2 * kOverhead,
+      registry->referencedBytes());
+
+  registry->closeAll(terminated());
+
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * The empty-queue rule holds in merge mode: an empty queue takes a message
+ * above the per-stream limit as it is, without merging it. The next update
+ * enters merge mode and overflows the queue.
+ */
+TEST(KvStoreStreamRegistryTest, EmptyQueueAcceptsMessageInMergeMode) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = mergeLimits();
+  limits.maxQueueBytes = 1;
+
+  registry->fanOut(makeUpdate({{"key1", "v1"}, {"key2", "v1"}}), limits);
+  EXPECT_EQ(0, registry->overflowDrops());
+  EXPECT_EQ(1, handle.queue().queuedMessages());
+  EXPECT_NE(nullptr, handle.queue().frontPublicationForTest());
+
+  registry->fanOut(makeUpdate({{"key3", "v1"}}), limits);
+  EXPECT_EQ(1, registry->overflowDrops());
+  EXPECT_EQ(0, registry->size());
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * A queue in merge mode is behind, and its merged entries are its own:
+ * closing it frees their budget bytes, the overhead included.
+ */
+TEST(KvStoreStreamRegistryTest, EvictableBytesIncludeMergedEntries) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto merging = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
+
+  ASSERT_EQ(1, merging.queue().queuedMessages());
+  EXPECT_EQ(
+      merging.queue().queuedBytes() + 2 * kOverhead,
+      merging.queue().evictableBytes());
+  EXPECT_EQ(registry->referencedBytes(), merging.queue().evictableBytes());
+}
+
+/*
+ * At merge entry, many distinct small keys fold into entries that count
+ * their serialized bytes against the per-stream limit, so the queue's bytes
+ * do not grow and the stream stays open. The per-entry overhead (several
+ * times these entries) counts only in the total budget, which returns to 0
+ * once the merged entries pop. Under the old accounting (overhead counted
+ * per stream), entering merge mode closed this stream.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeEntryWithSmallKeysKeepsStream) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = kTestLimits;
+  limits.mergeBytes = 16 * 1024;
+  limits.mergeExitBytes = 8 * 1024;
+  limits.maxQueueBytes = 2 * limits.mergeBytes;
+  limits.maxTotalBytes = 64 * 1024 * 1024;
+
+  // Same-size keys: every message has the same bytes.
+  size_t messages{0};
+  size_t bytesBefore{0};
+  while (!handle.queue().isMerging()) {
+    CO_ASSERT_GT(limits.mergeBytes, messages);
+    bytesBefore = handle.queue().queuedBytes();
+    registry->fanOut(
+        makeUpdate({{fmt::format("k{:05}", messages), "v"}}), limits);
+    ++messages;
+  }
+  const auto messageBytes = bytesBefore / (messages - 1);
+  CO_ASSERT_LT(100, messages);
+
+  EXPECT_EQ(0, registry->overflowDrops());
+  EXPECT_FALSE(handle.queue().isClosed());
+  EXPECT_EQ(1, registry->size());
+  EXPECT_GE(bytesBefore + messageBytes, handle.queue().queuedBytes());
+  EXPECT_EQ(
+      handle.queue().queuedBytes() + messages * kOverhead,
+      registry->referencedBytes());
+  // With the overhead, the merged entries would exceed the per-stream limit.
+  EXPECT_LT(limits.maxQueueBytes, registry->referencedBytes());
+
+  size_t popped{0};
+  while (handle.queue().queuedMessages() > 0) {
+    popped += (co_await handle.queue().pop()).keyVals()->size();
+  }
+  EXPECT_EQ(messages, popped);
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * A key at version 6 expires and comes back at version 1 while the queue
+ * merges. The client receives the expiry before the re-creation and ends
+ * with version 1, as on a queue that does not merge.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeSendsExpiryBeforeRecreation) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = mergeLimits();
+  thrift::KeyVals client;
+  applyLikeClient(client, makeVersioned("k", 4));
+
+  registry->fanOut(makeVersioned("k", 5), limits);
+  registry->fanOut(makeVersioned("k", 6), limits);
+  registry->fanOut(makeUpdate({}, {"k"}), limits);
+  registry->fanOut(makeVersioned("k", 1), limits);
+
+  CO_ASSERT_TRUE(handle.queue().isMerging());
+  CO_ASSERT_EQ(2, handle.queue().queuedMessages());
+  while (handle.queue().queuedMessages() > 0) {
+    applyLikeClient(client, co_await handle.queue().pop());
+  }
+  CO_ASSERT_EQ(1, client.count("k"));
+  EXPECT_EQ(1, *client.at("k").version());
+}
+
+/*
+ * Merged pops are capped at kKvStoreStreamMergedPopMaxBytes, and the queue
+ * leaves merge mode only once a pop leaves less than the exit value: it
+ * stays in merge mode between the two thresholds. Entries of about 400 KiB:
+ * two fit in one pop.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeStaysBetweenThresholds) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = kTestLimits;
+  limits.maxQueueBytes = 64 * 1024 * 1024;
+  limits.maxTotalBytes = 64 * 1024 * 1024;
+  limits.mergeBytes = 3 * 1024 * 1024;
+  limits.mergeExitBytes = 1024 * 1024;
+  const std::string big(400 * 1024, 'x');
+
+  // The eighth update reaches 3 MiB: all eight fold into one segment.
+  for (int i = 0; i < 8; ++i) {
+    registry->fanOut(makeUpdate({{fmt::format("k{}", i), big}}), limits);
+  }
+  CO_ASSERT_TRUE(handle.queue().isMerging());
+  CO_ASSERT_EQ(1, handle.queue().queuedMessages());
+
+  // 8 -> 6 -> 4 entries: between the thresholds, so updates keep merging.
+  for (int pops = 0; pops < 2; ++pops) {
+    const auto pub = co_await handle.queue().pop();
+    CO_ASSERT_EQ(2, pub.keyVals()->size());
+    EXPECT_GE(Constants::kKvStoreStreamMergedPopMaxBytes, serializedSize(pub));
+    EXPECT_TRUE(handle.queue().isMerging());
+    EXPECT_LE(limits.mergeExitBytes, handle.queue().queuedBytes());
+    EXPECT_GT(limits.mergeBytes, handle.queue().queuedBytes());
+  }
+  registry->fanOut(makeUpdate({{"k0", "v2"}}), limits);
+  EXPECT_EQ(nullptr, handle.queue().frontPublicationForTest());
+  EXPECT_EQ(2, handle.queue().queuedMessages());
+
+  // 4 -> 2 entries and k0: below 1 MiB, the queue leaves merge mode.
+  EXPECT_EQ(2, (co_await handle.queue().pop()).keyVals()->size());
+  EXPECT_FALSE(handle.queue().isMerging());
+  registry->fanOut(makeUpdate({{"k0", "v3"}}), limits);
+  EXPECT_NE(nullptr, handle.queue().frontPublicationForTest());
+
+  // Merged entries are older than the queued message, and pop first.
+  EXPECT_EQ(2, (co_await handle.queue().pop()).keyVals()->size());
+  EXPECT_EQ("v2", *(co_await handle.queue().pop()).keyVals()->at("k0").value());
+  EXPECT_EQ("v3", *(co_await handle.queue().pop()).keyVals()->at("k0").value());
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * In merge mode, a push signals only when it starts a segment: 100 updates
+ * of one key leave one token for one segment.
+ */
+TEST(KvStoreStreamRegistryTest, MergeSignalsOncePerSegment) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+
+  for (int i = 0; i < 100; ++i) {
+    registry->fanOut(
+        makeUpdate({{"key1", fmt::format("v{}", i)}}), mergeLimits());
+  }
+
+  EXPECT_EQ(1, handle.queue().queuedMessages());
+  EXPECT_EQ(1, handle.queue().availableTokensForTest());
+}
+
+/*
+ * A pop that leaves part of a segment signals again, so the next pop finds
+ * the rest without waiting: the queue holds one token per segment. The two
+ * entries of 600 KiB do not fit in one pop.
+ */
+CO_TEST(KvStoreStreamRegistryTest, ChunkedPopKeepsSegmentToken) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = mergeLimits();
+  limits.maxQueueBytes = 64 * 1024 * 1024;
+  limits.maxTotalBytes = 64 * 1024 * 1024;
+  const std::string big(600 * 1024, 'x');
+  registry->fanOut(makeUpdate({{"a", "v1"}}), limits);
+  registry->fanOut(makeUpdate({{"b", big}, {"c", big}}), limits);
+  CO_ASSERT_EQ(1, handle.queue().queuedMessages());
+  CO_ASSERT_EQ(1, handle.queue().availableTokensForTest());
+
+  // Entries pop in map order: the first pop takes one or two of the three.
+  const auto first = (co_await handle.queue().pop()).keyVals()->size();
+  CO_ASSERT_GT(3, first);
+
+  EXPECT_EQ(1, handle.queue().queuedMessages());
+  CO_ASSERT_EQ(1, handle.queue().availableTokensForTest());
+  EXPECT_EQ(3 - first, (co_await handle.queue().pop()).keyVals()->size());
+  EXPECT_EQ(0, handle.queue().queuedMessages());
+  EXPECT_EQ(0, handle.queue().availableTokensForTest());
+}
+
+/*
+ * Folding ten queued messages into one segment leaves nine surplus tokens.
+ * After the segment pops, the next pop() finds the queue empty, takes the
+ * surplus and waits; it then returns the next update. (Draining with
+ * try_wait() saves the wakeups; the end state is the same either way.)
+ */
+CO_TEST(KvStoreStreamRegistryTest, PopDrainsSurplusTokens) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  for (int i = 0; i < 10; ++i) {
+    registry->fanOut(
+        makeUpdate({{"key1", fmt::format("v{}", i)}}), kTestLimits);
+  }
+  registry->fanOut(makeUpdate({{"key1", "v10"}}), mergeLimits());
+  CO_ASSERT_EQ(1, handle.queue().queuedMessages());
+  CO_ASSERT_EQ(10, handle.queue().availableTokensForTest());
+  EXPECT_EQ(
+      "v10", *(co_await handle.queue().pop()).keyVals()->at("key1").value());
+  EXPECT_EQ(9, handle.queue().availableTokensForTest());
+
+  folly::CancellationSource cancel;
+  auto [popped, check] = co_await folly::coro::collectAllTry(
+      folly::coro::co_withCancellation(cancel.getToken(), handle.queue().pop()),
+      [&]() -> folly::coro::Task<void> {
+        // pop() took the surplus and waits.
+        EXPECT_EQ(0, handle.queue().availableTokensForTest());
+        cancel.requestCancellation();
+        co_return;
+      }());
+  EXPECT_TRUE(popped.hasException<folly::OperationCancelled>());
+  EXPECT_FALSE(check.hasException());
+
+  registry->fanOut(makeUpdate({{"key1", "v11"}}), kTestLimits);
+  EXPECT_EQ(
+      "v11", *(co_await handle.queue().pop()).keyVals()->at("key1").value());
+}
+
+/*
+ * A TTL refresh onto a merged value keeps the value and takes the new TTL; a
+ * TTL refresh of a key with no merged value stays a TTL refresh.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeTtlRefreshes) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = mergeLimits();
+  thrift::Publication refresh;
+  refresh.area() = kArea;
+  for (const auto& key : {"key1", "key2"}) {
+    refresh.keyVals()->emplace(
+        key, createThriftValue(1, "node1", std::nullopt, 5000, 3));
+  }
+
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), limits);
+  registry->fanOut(makeUpdate({{"key1", "v2"}}), limits);
+  registry->fanOut(refresh, limits);
+
+  const auto pub = co_await handle.queue().pop();
+  const auto& key1 = pub.keyVals()->at("key1");
+  EXPECT_EQ("v2", key1.value().value());
+  EXPECT_EQ(5000, *key1.ttl());
+  EXPECT_EQ(3, *key1.ttlVersion());
+  const auto& key2 = pub.keyVals()->at("key2");
+  EXPECT_FALSE(key2.value().has_value());
+  EXPECT_EQ(3, *key2.ttlVersion());
+}
+
+// Each area merges apart and pops as its own Publication.
+CO_TEST(KvStoreStreamRegistryTest, MergeKeepsAreasApart) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  thrift::KeyDumpParams params;
+  params.ignoreTtl() = false;
+  auto handle =
+      add(*registry,
+          1,
+          KvStorePublicationFilter({kArea, "area2"}, std::move(params)));
+  const auto limits = mergeLimits();
+  auto other = makeUpdate({{"key1", "other"}});
+  other.area() = "area2";
+
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), limits);
+  registry->fanOut(other, limits);
+  registry->fanOut(makeUpdate({{"key1", "v2"}}), limits);
+
+  CO_ASSERT_EQ(2, handle.queue().queuedMessages());
+  const auto first = co_await handle.queue().pop();
+  const auto second = co_await handle.queue().pop();
+  EXPECT_EQ(kArea, *first.area());
+  EXPECT_EQ("v2", *first.keyVals()->at("key1").value());
+  EXPECT_EQ("area2", *second.area());
+  EXPECT_EQ("other", *second.keyVals()->at("key1").value());
+}
+
+/*
+ * Merge mode ends while a merged segment remains, a message queues behind
+ * it, and the queue enters merge mode again: the message folds into the
+ * remaining segment of its area, and an area whose segment already popped
+ * starts a new one.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeReentryWithMergedAndQueuedEntries) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  thrift::KeyDumpParams params;
+  params.ignoreTtl() = false;
+  auto handle =
+      add(*registry,
+          1,
+          KvStorePublicationFilter({kArea, "area2"}, std::move(params)));
+  // Any pop leaves merge mode.
+  auto exitAtPop = mergeLimits();
+  exitAtPop.mergeExitBytes = std::numeric_limits<size_t>::max();
+  const auto inArea2 = [](thrift::Publication pub) {
+    pub.area() = "area2";
+    return pub;
+  };
+
+  registry->fanOut(makeUpdate({{"a", "v1"}}), exitAtPop);
+  registry->fanOut(inArea2(makeUpdate({{"b", "v1"}})), exitAtPop);
+  CO_ASSERT_EQ(2, handle.queue().queuedMessages());
+  EXPECT_EQ("v1", *(co_await handle.queue().pop()).keyVals()->at("a").value());
+  CO_ASSERT_FALSE(handle.queue().isMerging());
+
+  registry->fanOut(inArea2(makeUpdate({{"b", "v2"}})), kTestLimits);
+  registry->fanOut(makeUpdate({{"a", "v2"}}), kTestLimits);
+  CO_ASSERT_NE(nullptr, handle.queue().frontPublicationForTest());
+  registry->fanOut(inArea2(makeUpdate({{"b", "v3"}})), mergeLimits());
+
+  CO_ASSERT_TRUE(handle.queue().isMerging());
+  CO_ASSERT_EQ(2, handle.queue().queuedMessages());
+  const auto first = co_await handle.queue().pop();
+  EXPECT_EQ("area2", *first.area());
+  EXPECT_EQ("v3", *first.keyVals()->at("b").value());
+  const auto second = co_await handle.queue().pop();
+  EXPECT_EQ(kArea, *second.area());
+  EXPECT_EQ("v2", *second.keyVals()->at("a").value());
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * In merge mode, the merged bytes count against the per-stream limit: the
+ * fourth key takes the queue above three entries' worth and closes it.
+ */
+CO_TEST(KvStoreStreamRegistryTest, OverflowInMergeMode) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = mergeLimits();
+  limits.maxQueueBytes =
+      3 *
+      KvStoreStreamMergeBuffer::entryBytes(
+          "key1", createThriftValue(1, "node1", std::string("v1")));
+
+  for (int i = 1; i <= 3; ++i) {
+    registry->fanOut(makeUpdate({{fmt::format("key{}", i), "v1"}}), limits);
+  }
+  CO_ASSERT_TRUE(handle.queue().isMerging());
+  EXPECT_EQ(0, registry->overflowDrops());
+
+  registry->fanOut(makeUpdate({{"key4", "v1"}}), limits);
+  EXPECT_EQ(1, registry->overflowDrops());
+  EXPECT_EQ(0, registry->size());
+  EXPECT_EQ(0, registry->referencedBytes());
+  auto end = co_await folly::coro::co_awaitTry(handle.queue().pop());
+  EXPECT_TRUE(end.hasException<std::runtime_error>());
+}
+
+// Destroying a queue in merge mode releases its merged bytes.
+TEST(KvStoreStreamRegistryTest, DestructorReleasesMergedBytes) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  {
+    auto handle = add(*registry, 1, allKeysFilter());
+    registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+    registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
+    ASSERT_TRUE(handle.queue().isMerging());
+    ASSERT_EQ(
+        handle.queue().queuedBytes() + 2 * kOverhead,
+        registry->referencedBytes());
+  }
+  EXPECT_EQ(0, registry->size());
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * Two all-keys subscribers share messages; only the one that is behind
+ * merges. The budget counts the shared message once and the two merged
+ * entries once with their overhead, and returns to 0 when both drain.
+ */
+CO_TEST(KvStoreStreamRegistryTest, SharedMessageWithOneMergingSubscriber) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto behind = add(*registry, 1, allKeysFilter());
+  auto caughtUp = add(*registry, 2, allKeysFilter());
+  registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  co_await caughtUp.queue().pop();
+
+  registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
+
+  CO_ASSERT_TRUE(behind.queue().isMerging());
+  CO_ASSERT_FALSE(caughtUp.queue().isMerging());
+  EXPECT_EQ(
+      behind.queue().queuedBytes() + 2 * kOverhead +
+          caughtUp.queue().queuedBytes(),
+      registry->referencedBytes());
+  co_await behind.queue().pop();
+  co_await caughtUp.queue().pop();
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * A doNotPublishValue subscriber gets values without their data, which look
+ * like TTL refreshes: merging keeps the latest version.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeDoNotPublishValue) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  thrift::KeyDumpParams params;
+  params.doNotPublishValue() = true;
+  auto handle =
+      add(*registry, 1, KvStorePublicationFilter({kArea}, std::move(params)));
+
+  registry->fanOut(makeVersioned("k", 1), mergeLimits());
+  registry->fanOut(makeVersioned("k", 2), mergeLimits());
+  registry->fanOut(makeVersioned("k", 3), mergeLimits());
+
+  CO_ASSERT_TRUE(handle.queue().isMerging());
+  const auto pub = co_await handle.queue().pop();
+  const auto& value = pub.keyVals()->at("k");
+  EXPECT_EQ(3, *value.version());
+  EXPECT_FALSE(value.value().has_value());
 }
 
 } // namespace openr
