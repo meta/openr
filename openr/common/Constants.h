@@ -446,6 +446,32 @@ class Constants {
   static constexpr std::chrono::seconds kKvStoreStreamSnapshotSlotTimeout{15};
 
   /*
+   * KvStore stream memory, applied with enable_ctrl_thrift_server_limits.
+   * Bytes are the Compact serialized size of the messages; the in-memory
+   * Publications (map nodes, strings) are larger.
+   *
+   * Per stream: when a queue that holds messages would exceed this, Open/R
+   * closes the stream and frees its queue. An empty queue accepts a message
+   * of any size.
+   */
+  static constexpr size_t kKvStoreStreamQueueMaxBytes{32 * 1024 * 1024};
+  /*
+   * All streams, each message counted once while anything references it.
+   * Above this, Open/R closes the stream that is behind (more than one
+   * queued message) and whose close frees the most bytes, until the total
+   * fits or no such stream remains. Eight streams at the per-stream limit
+   * fill it.
+   *
+   * Not counted: snapshots (kKvStoreStreamMaxSnapshotsInFlight bounds
+   * them), and stream payloads that a pop handed to Thrift. Each
+   * connection's write buffer holds about kKvStoreStreamSendQuotaBytes plus
+   * one payload before Thrift pauses its streams;
+   * kOpenrCtrlThriftEgressMemoryLimitBytes caps all write buffers together
+   * only with enable_ctrl_thrift_server_limits.
+   */
+  static constexpr size_t kKvStoreStreamTotalMaxBytes{256 * 1024 * 1024};
+
+  /*
    *
    * See https://github.com/facebook/openr/blob/master/openr/docs/Versions.md
    * for details of version history

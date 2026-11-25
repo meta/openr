@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
 #include <folly/logging/xlog.h>
 #include <thrift/lib/cpp2/protocol/CompactProtocol.h>
 
@@ -29,6 +30,11 @@ namespace {
 constexpr std::string_view kSubscribersCounter{"subscribers.kvstore"};
 constexpr std::string_view kSnapshotSlotReclaimsStat{
     "subscribers.kvstore.snapshot_slot_reclaims"};
+constexpr std::string_view kQueuedBytesCounter{
+    "subscribers.kvstore.queued_bytes"};
+constexpr std::string_view kOverflowDropsStat{
+    "subscribers.kvstore.overflow_drops"};
+constexpr std::string_view kBudgetDropsStat{"subscribers.kvstore.budget_drops"};
 
 size_t
 serializedSize(const thrift::Publication& pub) {
@@ -36,40 +42,63 @@ serializedSize(const thrift::Publication& pub) {
   return pub.serializedSizeZC(&writer);
 }
 
-KvStoreStreamMessage
-makeMessage(thrift::Publication&& pub) {
-  pub.timestamp_ms() = getUnixTimeStampMs();
-  auto publication = std::make_shared<thrift::Publication>(std::move(pub));
-  const auto bytes = serializedSize(*publication);
-  return KvStoreStreamMessage{std::move(publication), bytes};
-}
+/*
+ * A Publication that charges the total stream budget while it lives. One
+ * allocation holds both; messages reference the Publication through an
+ * aliasing shared_ptr.
+ */
+struct ChargedPublication {
+  ChargedPublication(
+      thrift::Publication&& pub,
+      size_t bytes,
+      std::shared_ptr<std::atomic<size_t>> budget)
+      : publication(std::move(pub)), bytes(bytes), budget(std::move(budget)) {
+    // Charged once construction can no longer throw.
+    this->budget->fetch_add(bytes);
+  }
+  ChargedPublication(const ChargedPublication&) = delete;
+  ChargedPublication& operator=(const ChargedPublication&) = delete;
+  ChargedPublication(ChargedPublication&&) = delete;
+  ChargedPublication& operator=(ChargedPublication&&) = delete;
+  ~ChargedPublication() {
+    budget->fetch_sub(bytes);
+  }
 
-// The message for subscribers with `filter`, or std::nullopt for no message.
-std::optional<KvStoreStreamMessage>
-makeFilteredMessage(
-    const KvStorePublicationFilter& filter, const thrift::Publication& pub) {
-  if (filter.keepsAllKeys()) {
-    return makeMessage(thrift::Publication(pub));
-  }
-  if (auto filtered = filter.apply(pub)) {
-    return makeMessage(std::move(*filtered));
-  }
-  return std::nullopt;
-}
+  thrift::Publication publication;
+  const size_t bytes;
+  const std::shared_ptr<std::atomic<size_t>> budget;
+};
 
 } // namespace
 
-void
-KvStoreStreamQueue::push(KvStoreStreamMessage message) {
+KvStoreStreamQueue::PushResult
+KvStoreStreamQueue::push(KvStoreStreamMessage message, size_t maxBytes) {
+  auto result = PushResult::QUEUED;
+  // Destroyed after the lock is released: freeing Publications takes time.
+  std::deque<KvStoreStreamMessage> dropped;
   {
     auto state = state_.wlock();
     if (state->closeReason) {
-      return;
+      return PushResult::CLOSED;
     }
-    state->bytes += message.bytes;
-    state->messages.push_back(std::move(message));
+    /*
+     * An empty queue accepts any message: its client is not behind, and the
+     * total budget bounds the memory.
+     */
+    if (!state->messages.empty() && state->bytes + message.bytes > maxBytes) {
+      state->closeReason =
+          folly::make_exception_wrapper<std::runtime_error>(fmt::format(
+              "KvStore stream queue limit of {} bytes exceeded", maxBytes));
+      dropped.swap(state->messages);
+      state->bytes = 0;
+      result = PushResult::OVERFLOW;
+    } else {
+      state->bytes += message.bytes;
+      state->messages.push_back(std::move(message));
+    }
   }
   available_.signal();
+  return result;
 }
 
 folly::coro::Task<thrift::Publication>
@@ -107,13 +136,15 @@ KvStoreStreamQueue::pop() {
 
 void
 KvStoreStreamQueue::close(folly::exception_wrapper reason) {
+  // Destroyed after the lock is released: freeing Publications takes time.
+  std::deque<KvStoreStreamMessage> dropped;
   {
     auto state = state_.wlock();
     if (state->closeReason) {
       return;
     }
     state->closeReason = std::move(reason);
-    state->messages.clear();
+    dropped.swap(state->messages);
     state->bytes = 0;
   }
   available_.signal();
@@ -127,6 +158,31 @@ KvStoreStreamQueue::queuedBytes() const {
 size_t
 KvStoreStreamQueue::queuedMessages() const {
   return state_.rlock()->messages.size();
+}
+
+bool
+KvStoreStreamQueue::isClosed() const {
+  return static_cast<bool>(state_.rlock()->closeReason);
+}
+
+size_t
+KvStoreStreamQueue::evictableBytes() const {
+  auto state = state_.rlock();
+  if (state->messages.size() <= 1) {
+    return 0;
+  }
+  size_t bytes{0};
+  for (const auto& message : state->messages) {
+    /*
+     * use_count() only ranks queues here; nothing reads or moves the
+     * Publication based on it. A message that is not shared was only ever
+     * in this queue.
+     */
+    if (!message.shared || message.publication.use_count() == 1) {
+      bytes += message.bytes;
+    }
+  }
+  return bytes;
 }
 
 int64_t
@@ -261,25 +317,69 @@ KvStoreStreamRegistry::releaseSnapshotSlot(int64_t id) {
   });
 }
 
-void
-KvStoreStreamRegistry::remove(int64_t id) {
-  state_.withWLock([&](auto& state) {
-    auto it = state.subscribers.find(id);
-    if (it == state.subscribers.end()) {
-      return;
-    }
-    if (it->second->holdsSnapshotSlot) {
-      --state.snapshotsInFlight;
-    }
-    state.subscribers.erase(it);
-    facebook::fb303::fbData->setCounter(
-        kSubscribersCounter, state.subscribers.size());
-  });
-  XLOGF(INFO, "KvStore stream-{} ended.", id);
+bool
+KvStoreStreamRegistry::erase(State& state, int64_t id) {
+  auto it = state.subscribers.find(id);
+  if (it == state.subscribers.end()) {
+    return false;
+  }
+  // A slot that tryAdd() reclaimed no longer counts.
+  if (it->second->holdsSnapshotSlot) {
+    --state.snapshotsInFlight;
+  }
+  state.subscribers.erase(it);
+  facebook::fb303::fbData->setCounter(
+      kSubscribersCounter, state.subscribers.size());
+  return true;
 }
 
 void
-KvStoreStreamRegistry::fanOut(const thrift::Publication& pub) {
+KvStoreStreamRegistry::remove(int64_t id) {
+  if (state_.withWLock([&](auto& state) { return erase(state, id); })) {
+    XLOGF(INFO, "KvStore stream-{} ended.", id);
+  }
+}
+
+void
+KvStoreStreamRegistry::removeClosed(const std::vector<int64_t>& ids) {
+  if (ids.empty()) {
+    return;
+  }
+  state_.withWLock([&](auto& state) {
+    for (const auto id : ids) {
+      erase(state, id);
+    }
+  });
+}
+
+KvStoreStreamMessage
+KvStoreStreamRegistry::makeMessage(thrift::Publication&& pub) const {
+  pub.timestamp_ms() = getUnixTimeStampMs();
+  const auto bytes = serializedSize(pub);
+  auto owner = std::make_shared<ChargedPublication>(
+      std::move(pub), bytes, referencedBytes_);
+  auto* publication = &owner->publication;
+  return KvStoreStreamMessage{
+      std::shared_ptr<thrift::Publication>(std::move(owner), publication),
+      bytes};
+}
+
+std::optional<KvStoreStreamMessage>
+KvStoreStreamRegistry::makeFilteredMessage(
+    const KvStorePublicationFilter& filter,
+    const thrift::Publication& pub) const {
+  if (filter.keepsAllKeys()) {
+    return makeMessage(thrift::Publication(pub));
+  }
+  if (auto filtered = filter.apply(pub)) {
+    return makeMessage(std::move(*filtered));
+  }
+  return std::nullopt;
+}
+
+void
+KvStoreStreamRegistry::fanOut(
+    const thrift::Publication& pub, const KvStoreStreamLimits& limits) {
   /*
    * Filter, copy, serialize and push outside the lock. A subscriber removed
    * meanwhile stays alive through its shared_ptr, and a push to a closed
@@ -317,16 +417,85 @@ KvStoreStreamRegistry::fanOut(const thrift::Publication& pub) {
     it->members.push_back(subscriber.get());
   }
 
+  std::vector<int64_t> overflowed;
+  const auto push = [&](KvStoreStreamSubscriber& member,
+                        KvStoreStreamMessage message) {
+    if (member.queue.push(std::move(message), limits.maxQueueBytes) ==
+        KvStoreStreamQueue::PushResult::OVERFLOW) {
+      overflowed.push_back(member.id);
+    }
+  };
   for (const auto& group : groups) {
+    // Dropped at the end of the iteration: the budget counts queued bytes.
     auto message = makeFilteredMessage(group.members.front()->filter, pub);
     if (!message) {
       continue;
     }
     message->shared = group.members.size() > 1;
     for (size_t i = 0; i + 1 < group.members.size(); ++i) {
-      group.members[i]->queue.push(*message);
+      push(*group.members[i], *message);
     }
-    group.members.back()->queue.push(std::move(*message));
+    push(*group.members.back(), std::move(*message));
+  }
+
+  for (const auto id : overflowed) {
+    ++overflowDrops_;
+    facebook::fb303::fbData->addStatValue(
+        kOverflowDropsStat, 1, facebook::fb303::COUNT);
+    XLOGF(
+        WARNING,
+        "KvStore stream-{} closed: queue limit of {} bytes exceeded",
+        id,
+        limits.maxQueueBytes);
+  }
+  // A closed stream leaves at once: it no longer counts for admission.
+  removeClosed(overflowed);
+  enforceTotalBudget(limits.maxTotalBytes);
+  facebook::fb303::fbData->setCounter(kQueuedBytesCounter, referencedBytes());
+}
+
+void
+KvStoreStreamRegistry::enforceTotalBudget(size_t maxTotalBytes) {
+  /*
+   * Each pass closes the queue whose close frees the most bytes. Queues that
+   * are not behind, or whose messages other queues also reference, are no
+   * candidates: closing them frees nothing. A closed queue leaves the
+   * registry, so the loop ends after at most one pass per subscriber.
+   */
+  while (referencedBytes() > maxTotalBytes) {
+    std::shared_ptr<KvStoreStreamSubscriber> candidate;
+    size_t candidateBytes{0};
+    state_.withRLock([&](const auto& state) {
+      for (const auto& [_, subscriber] : state.subscribers) {
+        const auto bytes = subscriber->queue.evictableBytes();
+        if (bytes > candidateBytes) {
+          candidate = subscriber;
+          candidateBytes = bytes;
+        }
+      }
+    });
+    if (!candidate) {
+      /*
+       * The remaining bytes belong to messages that pops hold, to queues
+       * with one message, or to messages that several queues share.
+       */
+      return;
+    }
+    candidate->queue.close(
+        folly::make_exception_wrapper<std::runtime_error>(fmt::format(
+            "KvStore stream total budget of {} bytes exceeded",
+            maxTotalBytes)));
+    ++budgetDrops_;
+    facebook::fb303::fbData->addStatValue(
+        kBudgetDropsStat, 1, facebook::fb303::COUNT);
+    XLOGF(
+        WARNING,
+        "KvStore stream-{} closed: total budget of {} bytes exceeded, "
+        "its queue alone referenced {} bytes",
+        candidate->id,
+        maxTotalBytes,
+        candidateBytes);
+    removeClosed({candidate->id});
   }
 }
 

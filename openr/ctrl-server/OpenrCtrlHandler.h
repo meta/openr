@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include <fb303/BaseService.h>
+#include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/AsyncGenerator.h>
 #include <openr/common/Types.h>
@@ -621,10 +622,16 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
     return kvStoreStreams_->snapshotsInFlight();
   }
 
-  // Call before any subscription.
+  // Thread-safe; applies to later subscriptions and publications.
   inline void
   setKvStoreStreamLimitsForTest(KvStoreStreamLimits limits) {
-    kvStoreStreamLimits_ = limits;
+    *kvStoreStreamLimits_.wlock() = limits;
+  }
+
+  // Streams closed at the per-stream limit.
+  inline int64_t
+  getNumKvStoreStreamOverflowDrops() {
+    return kvStoreStreams_->overflowDrops();
   }
 
   inline size_t
@@ -692,11 +699,11 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
 
   /*
    * Admits a queue stream: checks the snapshot gate and the subscriber cap,
-   * then registers the subscriber. Above a limit, throws a Thrift
-   * LOADSHEDDING error, counts the reject by limit, and registers nothing;
-   * the connection stays open.
+   * then registers the subscriber and returns its handle. Above a limit,
+   * throws a Thrift LOADSHEDDING error, counts the reject by limit, and
+   * registers nothing; the connection stays open.
    */
-  apache::thrift::ServerStream<thrift::Publication> admitKvStoreStream(
+  KvStoreStreamHandle admitKvStoreStream(
       const thrift::KeyDumpParams& filter,
       const std::set<std::string>& selectAreas);
 
@@ -739,9 +746,16 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   // Open/R-owned KvStore stream queues (enable_ctrl_thrift_server_limits)
   const std::shared_ptr<KvStoreStreamRegistry> kvStoreStreams_{
       std::make_shared<KvStoreStreamRegistry>()};
-  KvStoreStreamLimits kvStoreStreamLimits_{
-      .maxSnapshotsInFlight = Constants::kKvStoreStreamMaxSnapshotsInFlight,
-      .maxSubscribers = Constants::kKvStoreStreamMaxSubscribers};
+  /*
+   * Read on Thrift threads (admission) and on the ctrl event base (fan-out);
+   * tests replace it.
+   */
+  folly::Synchronized<KvStoreStreamLimits> kvStoreStreamLimits_{
+      KvStoreStreamLimits{
+          .maxSnapshotsInFlight = Constants::kKvStoreStreamMaxSnapshotsInFlight,
+          .maxSubscribers = Constants::kKvStoreStreamMaxSubscribers,
+          .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
+          .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes}};
 
   // Active Fib streaming publishers
   folly::Synchronized<folly::F14FastMap<

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <folly/CppAttributes.h>
@@ -48,7 +49,19 @@ struct KvStoreStreamMessage {
  */
 class KvStoreStreamQueue {
  public:
-  void push(KvStoreStreamMessage message);
+  enum class PushResult {
+    QUEUED,
+    // The queue was closed before; the message is dropped.
+    CLOSED,
+    /*
+     * The queue held messages and this one would take it above maxBytes;
+     * the queue is closed.
+     */
+    OVERFLOW,
+  };
+
+  // An empty queue accepts any message, whatever its size.
+  PushResult push(KvStoreStreamMessage message, size_t maxBytes);
 
   /*
    * Waits for the next message. Moves the Publication out of a message that
@@ -62,6 +75,15 @@ class KvStoreStreamQueue {
 
   size_t queuedBytes() const;
   size_t queuedMessages() const;
+  // True after close(), or after push() closed the queue.
+  bool isClosed() const;
+  /*
+   * Bytes that closing the queue would free: its messages that no other
+   * queue references. 0 when the queue holds at most one message: its client
+   * is not behind. Example: 0 for a queue whose messages all-keys
+   * subscribers share.
+   */
+  size_t evictableBytes() const;
   // Messages that pop() handed to the stream.
   int64_t sentMessages() const;
   // When pop() last handed a message to the stream.
@@ -103,10 +125,15 @@ struct KvStoreStreamSubscriber {
   std::chrono::steady_clock::time_point admissionTime;
 };
 
-// Admission limits. Example: {.maxSnapshotsInFlight = 4, .maxSubscribers = 16}
+/*
+ * Admission and memory limits. Example: {.maxSnapshotsInFlight = 4,
+ * .maxSubscribers = 16, .maxQueueBytes = 32 MiB, .maxTotalBytes = 256 MiB}.
+ */
 struct KvStoreStreamLimits {
   size_t maxSnapshotsInFlight{0};
   size_t maxSubscribers{0};
+  size_t maxQueueBytes{0};
+  size_t maxTotalBytes{0};
 };
 
 /*
@@ -193,10 +220,17 @@ class KvStoreStreamRegistry
   /*
    * Adds a reference to `pub`, or to its filtered copy, to the queue of each
    * matching subscriber. Never blocks, and holds the registry lock only to
-   * copy the subscriber list. Subscribers with the same key filter
-   * (KvStorePublicationFilter::sameKeyFilter()) share one copy.
+   * copy the subscriber list and to remove closed subscribers. Subscribers with
+   * the same key filter (KvStorePublicationFilter::sameKeyFilter()) share one
+   * copy. Closes a queue that holds messages and would exceed
+   * limits.maxQueueBytes. While the referenced bytes exceed
+   * limits.maxTotalBytes, closes the queue with the most evictable bytes
+   * (KvStoreStreamQueue::evictableBytes()), and stops when no queue has any. A
+   * closed queue leaves the registry at once; its handle's removal is then a
+   * no-op.
    */
-  void fanOut(const thrift::Publication& pub);
+  void fanOut(
+      const thrift::Publication& pub, const KvStoreStreamLimits& limits);
 
   /*
    * Closes every queue; each stream ends with `reason`. Later tryAdd() calls
@@ -214,6 +248,22 @@ class KvStoreStreamRegistry
     return snapshotSlotReclaims_.load();
   }
 
+  // Bytes of the messages that queues reference, each message once.
+  size_t
+  referencedBytes() const {
+    return referencedBytes_->load();
+  }
+
+  // Streams closed at the per-stream limit and at the total budget.
+  int64_t
+  overflowDrops() const {
+    return overflowDrops_.load();
+  }
+  int64_t
+  budgetDrops() const {
+    return budgetDrops_.load();
+  }
+
   /*
    * One entry per subscriber. total_streamed_msgs counts the messages that
    * pop() handed to the stream (the publisher path counts every publication
@@ -224,8 +274,19 @@ class KvStoreStreamRegistry
 
  private:
   friend class KvStoreStreamHandle;
+  struct State;
+  // Removes the subscriber and its snapshot slot; false when it is gone.
+  static bool erase(State& state, int64_t id);
   void remove(int64_t id);
+  // Removes the subscribers whose queues fanOut() closed.
+  void removeClosed(const std::vector<int64_t>& ids);
   void releaseSnapshotSlot(int64_t id);
+  KvStoreStreamMessage makeMessage(thrift::Publication&& pub) const;
+  // The message for subscribers with `filter`, or std::nullopt for none.
+  std::optional<KvStoreStreamMessage> makeFilteredMessage(
+      const KvStorePublicationFilter& filter,
+      const thrift::Publication& pub) const;
+  void enforceTotalBudget(size_t maxTotalBytes);
 
   struct State {
     folly::F14FastMap<int64_t, std::shared_ptr<KvStoreStreamSubscriber>>
@@ -237,6 +298,15 @@ class KvStoreStreamRegistry
 
   folly::Synchronized<State> state_;
   std::atomic<int64_t> snapshotSlotReclaims_{0};
+
+  /*
+   * Each message charges its bytes at creation; the deleter of its shared_ptr
+   * releases them when the last reference drops. Shared with the deleters.
+   */
+  const std::shared_ptr<std::atomic<size_t>> referencedBytes_{
+      std::make_shared<std::atomic<size_t>>(0)};
+  std::atomic<int64_t> overflowDrops_{0};
+  std::atomic<int64_t> budgetDrops_{0};
 };
 
 } // namespace openr

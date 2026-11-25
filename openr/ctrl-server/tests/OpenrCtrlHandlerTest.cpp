@@ -18,6 +18,7 @@
 #include <folly/init/Init.h>
 #include <folly/synchronization/Baton.h>
 #include <thrift/lib/cpp2/TrustedServerException.h>
+#include <thrift/lib/cpp2/async/RpcOptions.h>
 #include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include <openr/common/Constants.h>
@@ -2847,6 +2848,16 @@ class OpenrCtrlStreamLimitsFixture : public OpenrCtrlFixture {
   customizeConfig(thrift::OpenrConfig& tConfig) override {
     tConfig.enable_ctrl_thrift_server_limits() = true;
   }
+
+  // The Constants limits with the given admission limits.
+  static KvStoreStreamLimits
+  admissionLimits(size_t maxSnapshotsInFlight, size_t maxSubscribers) {
+    return KvStoreStreamLimits{
+        .maxSnapshotsInFlight = maxSnapshotsInFlight,
+        .maxSubscribers = maxSubscribers,
+        .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
+        .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes};
+  }
 };
 
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, UpdateBeforeDumpReachesQueueStream) {
@@ -2898,8 +2909,7 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAndGetAreaKvStoresFromQueue) {
  * creates no subscriber. The connection keeps serving RPCs.
  */
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapReturnsLoadShedding) {
-  handler_->setKvStoreStreamLimitsForTest(
-      {.maxSnapshotsInFlight = 4, .maxSubscribers = 0});
+  handler_->setKvStoreStreamLimitsForTest(admissionLimits(4, 0));
   auto& client = getOpenrCtrlClient();
 
   auto rejected =
@@ -2919,8 +2929,7 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapReturnsLoadShedding) {
 
 // The subscriber cap counts every registered stream.
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapCountsStreams) {
-  handler_->setKvStoreStreamLimitsForTest(
-      {.maxSnapshotsInFlight = 4, .maxSubscribers = 2});
+  handler_->setKvStoreStreamLimitsForTest(admissionLimits(4, 2));
   auto first = co_await handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet);
   auto second =
       co_await handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet);
@@ -2940,8 +2949,7 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapCountsStreams) {
  * gate that stops rejecting fails the assertion instead of hanging.
  */
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, SnapshotGateReturnsLoadShedding) {
-  handler_->setKvStoreStreamLimitsForTest(
-      {.maxSnapshotsInFlight = 1, .maxSubscribers = 16});
+  handler_->setKvStoreStreamLimitsForTest(admissionLimits(1, 16));
   folly::Baton<> kvStoreEvbHeld;
   folly::Baton<> releaseKvStoreEvb;
   kvStoreWrapper_->getKvStore()->runInEventBaseThread([&]() {
@@ -2989,8 +2997,7 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, SnapshotGateReturnsLoadShedding) {
  * pulled; the slot is free and a second subscription is admitted.
  */
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, FirstPullReleasesSnapshotSlot) {
-  handler_->setKvStoreStreamLimitsForTest(
-      {.maxSnapshotsInFlight = 1, .maxSubscribers = 16});
+  handler_->setKvStoreStreamLimitsForTest(admissionLimits(1, 16));
   auto& client = getOpenrCtrlClient();
   const std::string key{"key1"};
   const auto value = createThriftValue(1, "node1", std::string("value1"));
@@ -3010,6 +3017,127 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, FirstPullReleasesSnapshotSlot) {
   CO_ASSERT_EQ(1, second.response.size());
   EXPECT_EQ(1, second.response.front().keyVals()->count(key));
   EXPECT_EQ(2, handler_->getNumKvStoreStreams());
+}
+
+/*
+ * A stream whose queue would exceed the per-stream limit ends with an error;
+ * its subscriber leaves at once and the overflow drop is counted. The client
+ * grants one credit and reads nothing, so Thrift pulls at most one update
+ * and two of the three reach the queue: the second one overflows it.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, QueueLimitEndsStream) {
+  auto limits = admissionLimits(4, 16);
+  limits.maxQueueBytes = 1;
+  handler_->setKvStoreStreamLimitsForTest(limits);
+  const auto dropsBefore = handler_->getNumKvStoreStreamOverflowDrops();
+  const auto statBefore =
+      facebook::fb303::fbData
+          ->getCounterIfExists("subscribers.kvstore.overflow_drops.count")
+          .value_or(0);
+  apache::thrift::RpcOptions options;
+  options.setChunkBufferSize(1);
+  auto responseAndStream =
+      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          options, thrift::KeyDumpParams{}, kSpineOnlySet);
+
+  for (const auto& key : {"key1", "key2", "key3"}) {
+    kvStoreWrapper_->setKey(
+        kSpineAreaId,
+        key,
+        createThriftValue(1, "node1", std::string("value")),
+        std::nullopt);
+  }
+  // The fan-out runs on the ctrl event base.
+  while (handler_->getNumKvStoreStreamOverflowDrops() != dropsBefore + 1 ||
+         handler_->getNumKvStoreStreams() != 0) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(
+      statBefore + 1,
+      facebook::fb303::fbData->getCounter(
+          "subscribers.kvstore.overflow_drops.count"));
+
+  // At most the one pulled update arrives before the error.
+  auto gen = std::move(responseAndStream.stream).toAsyncGenerator();
+  auto next = co_await folly::coro::co_awaitTry(
+      folly::coro::timeout(gen.next(), kKvStorePublicationTimeout));
+  if (next.hasValue()) {
+    CO_ASSERT_TRUE(next->has_value());
+    next = co_await folly::coro::co_awaitTry(
+        folly::coro::timeout(gen.next(), kKvStorePublicationTimeout));
+  }
+  CO_ASSERT_TRUE(next.hasException());
+  EXPECT_THAT(
+      next.exception().what().toStdString(), testing::HasSubstr("queue limit"));
+  EXPECT_EQ(0, handler_->getNumKvStoreSnapshotsInFlight());
+}
+
+/*
+ * A queue that closes at the per-stream limit while the snapshot is built
+ * ends the subscription with LOADSHEDDING: the client gets no snapshot, and
+ * neither the subscriber nor its snapshot slot remains. The KvStore event
+ * base is held so that both updates reach the queue before the dump runs.
+ */
+CO_TEST_F(
+    OpenrCtrlStreamLimitsFixture,
+    QueueClosedDuringSnapshotReturnsLoadShedding) {
+  auto limits = admissionLimits(4, 16);
+  limits.maxQueueBytes = 1;
+  handler_->setKvStoreStreamLimitsForTest(limits);
+  const auto dropsBefore = handler_->getNumKvStoreStreamOverflowDrops();
+  const auto rejectsBefore =
+      facebook::fb303::fbData
+          ->getCounterIfExists(
+              "subscribers.kvstore.subscribe_rejects.queue_closed.count")
+          .value_or(0);
+  folly::Baton<> kvStoreEvbHeld;
+  folly::Baton<> releaseKvStoreEvb;
+  kvStoreWrapper_->getKvStore()->runInEventBaseThread([&]() {
+    kvStoreEvbHeld.post();
+    releaseKvStoreEvb.wait();
+  });
+  kvStoreEvbHeld.wait();
+
+  // The inline start returns at the dump, after registration.
+  auto* executor = co_await folly::coro::co_current_executor;
+  auto responseFuture = co_withExecutor(
+                            folly::getKeepAliveToken(executor),
+                            handler_->co_subscribeAndDumpKvStore(
+                                thrift::KeyDumpParams{}, kSpineOnlySet))
+                            .startInlineUnsafe();
+  {
+    SCOPE_EXIT {
+      releaseKvStoreEvb.post();
+    };
+    CO_ASSERT_EQ(1, handler_->getNumKvStoreStreams());
+    // The second update takes the non-empty queue above 1 byte.
+    for (const auto& key : {"key1", "key2"}) {
+      kvStoreWrapper_->pushToKvStoreUpdatesQueue(
+          kSpineAreaId,
+          {{key, createThriftValue(1, "node1", std::string("value"))}});
+    }
+    // The fan-out runs on the ctrl event base.
+    while (handler_->getNumKvStoreStreamOverflowDrops() != dropsBefore + 1) {
+      std::this_thread::yield();
+    }
+  }
+
+  auto rejected = co_await folly::coro::co_awaitTry(
+      folly::coro::toTask(std::move(responseFuture)));
+  CO_ASSERT_TRUE(
+      rejected.hasException<apache::thrift::TrustedServerException>());
+  EXPECT_EQ(
+      apache::thrift::TApplicationException::LOADSHEDDING,
+      rejected.exception()
+          .get_exception<apache::thrift::TrustedServerException>()
+          ->toApplicationException()
+          .getType());
+  EXPECT_EQ(
+      rejectsBefore + 1,
+      facebook::fb303::fbData->getCounter(
+          "subscribers.kvstore.subscribe_rejects.queue_closed.count"));
+  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(0, handler_->getNumKvStoreSnapshotsInFlight());
 }
 
 // Handler shutdown ends each queue stream with "publisher terminated".

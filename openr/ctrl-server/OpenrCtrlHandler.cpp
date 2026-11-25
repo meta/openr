@@ -9,6 +9,7 @@
 #include <re2/re2.h>
 
 #include <filesystem>
+#include <optional>
 namespace fs = std::filesystem;
 
 #include <folly/ExceptionString.h>
@@ -295,7 +296,7 @@ OpenrCtrlHandler::processPublication(thrift::Publication&& pub) {
     }
   });
   if (isKvStoreStreamLimitsEnabled()) {
-    kvStoreStreams_->fanOut(pub);
+    kvStoreStreams_->fanOut(pub, kvStoreStreamLimits_.copy());
   }
 
   // check if any of KeyVal has 'adj' update
@@ -1335,19 +1336,46 @@ OpenrCtrlHandler::co_subscribeAndDumpKvStore(
     throw thrift::KvStoreError(kKvStoreNotInitializedError);
   }
 
-  auto stream = isKvStoreStreamLimitsEnabled()
-      ? admitKvStoreStream(filter, selectAreas)
-      : subscribeKvStoreFilter(
-            std::make_unique<thrift::KeyDumpParams>(filter),
-            std::make_unique<std::set<std::string>>(selectAreas));
+  /*
+   * A queue stream keeps its handle here until the snapshot is ready, so a
+   * queue that a limit closed during the dump ends the subscription before
+   * the snapshot is sent.
+   */
+  std::optional<KvStoreStreamHandle> handle;
+  std::optional<apache::thrift::ServerStream<thrift::Publication>> stream;
+  if (isKvStoreStreamLimitsEnabled()) {
+    handle.emplace(admitKvStoreStream(filter, selectAreas));
+  } else {
+    stream.emplace(subscribeKvStoreFilter(
+        std::make_unique<thrift::KeyDumpParams>(filter),
+        std::make_unique<std::set<std::string>>(selectAreas)));
+  }
   auto pubs = co_await kvStore_->co_dumpKvStoreKeys(
       std::move(filter), std::move(selectAreas));
+  if (handle) {
+    /*
+     * After stop(), the client gets the snapshot, and the stream ends with
+     * the stop() reason at its first pull.
+     */
+    if (!stopping_ && handle->queue().isClosed()) {
+      facebook::fb303::fbData->addStatValue(
+          "subscribers.kvstore.subscribe_rejects", 1, facebook::fb303::COUNT);
+      facebook::fb303::fbData->addStatValue(
+          "subscribers.kvstore.subscribe_rejects.queue_closed",
+          1,
+          facebook::fb303::COUNT);
+      throw apache::thrift::TrustedServerException::appOverloadError(
+          "KvStore stream closed at a memory limit while its snapshot was "
+          "built");
+    }
+    stream.emplace(streamKvStore(std::move(*handle)));
+  }
   for (auto& pub : *pubs) {
     pub.timestamp_ms() = getUnixTimeStampMs();
   }
   co_return apache::thrift::ResponseAndServerStream<
       std::vector<thrift::Publication>,
-      thrift::Publication>{std::move(*pubs), std::move(stream)};
+      thrift::Publication>{std::move(*pubs), std::move(*stream)};
 }
 
 bool
@@ -1355,15 +1383,14 @@ OpenrCtrlHandler::isKvStoreStreamLimitsEnabled() const {
   return config_ && config_->isCtrlThriftServerLimitsEnabled();
 }
 
-apache::thrift::ServerStream<thrift::Publication>
+KvStoreStreamHandle
 OpenrCtrlHandler::admitKvStoreStream(
     const thrift::KeyDumpParams& filter,
     const std::set<std::string>& selectAreas) {
   const auto clientToken = publisherToken_++;
+  const auto limits = kvStoreStreamLimits_.copy();
   auto handle = kvStoreStreams_->tryAdd(
-      clientToken,
-      KvStorePublicationFilter(selectAreas, filter),
-      kvStoreStreamLimits_);
+      clientToken, KvStorePublicationFilter(selectAreas, filter), limits);
   if (!handle) {
     const auto& rejection = handle.error();
     const bool snapshots =
@@ -1380,9 +1407,9 @@ OpenrCtrlHandler::admitKvStoreStream(
         "flight, {} of {} subscribers)",
         snapshots ? "snapshots in flight" : "subscribers",
         rejection.snapshotsInFlight,
-        kvStoreStreamLimits_.maxSnapshotsInFlight,
+        limits.maxSnapshotsInFlight,
         rejection.subscribers,
-        kvStoreStreamLimits_.maxSubscribers);
+        limits.maxSubscribers);
     XLOGF_EVERY_MS(
         WARNING,
         kKvStoreStreamRejectLogIntervalMs,
@@ -1400,7 +1427,7 @@ OpenrCtrlHandler::admitKvStoreStream(
       "KvStore stream-{} admitted for areas: {}",
       clientToken,
       folly::join(", ", selectAreas));
-  return streamKvStore(std::move(*handle));
+  return std::move(*handle);
 }
 
 folly::coro::AsyncGenerator<thrift::Publication&&>
