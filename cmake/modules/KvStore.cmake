@@ -5,13 +5,16 @@
 
 # Sources corresponding to the compiled Buck targets in openr/kvstore.
 set(OPENR_KVSTORE_SOURCES openr/kvstore/KvStorePublisher.cpp)
+set(OPENR_KVSTORE_PUBLICATION_FILTER_SOURCES
+  openr/kvstore/KvStorePublicationFilter.cpp
+)
 set(OPENR_KVSTORE_UTIL_SOURCES openr/kvstore/KvStoreUtil.cpp)
 set(OPENR_KVSTORE_WRAPPER_SOURCES openr/kvstore/KvStoreWrapper.cpp)
 set(OPENR_KVSTORE_PEER_INGRESS_LIMIT_SOURCES
   openr/kvstore/KvStorePeerIngressLimit.cpp
 )
 
-set(OPENR_KVSTORE_EXPECTED_SOURCE_COUNT 4)
+set(OPENR_KVSTORE_EXPECTED_SOURCE_COUNT 5)
 
 # Create KvStore's header-only and compiled targets in dependency order.
 #
@@ -48,12 +51,28 @@ macro(openr_add_kvstore_libraries)
   )
   add_library(OpenR::kvstore_params ALIAS openr_kvstore_params)
 
+  # Buck2 target: //openr/kvstore:kvstore-publication-filter
+  openr_add_library(
+    NAME openr_kvstore_publication_filter
+    SOURCES ${OPENR_KVSTORE_PUBLICATION_FILTER_SOURCES}
+    PRIVATE_DEPENDENCIES
+      openr_util
+      Folly::folly
+    PUBLIC_DEPENDENCIES
+      openr_kvstore_util
+      kv_store_cpp2
+  )
+  add_library(
+    OpenR::kvstore_publication_filter ALIAS openr_kvstore_publication_filter
+  )
+
   # Buck2 target: //openr/kvstore:kvstore
   openr_add_library(
     NAME openr_kvstore
     SOURCES ${OPENR_KVSTORE_SOURCES}
     PRIVATE_DEPENDENCIES openr_util
     PUBLIC_DEPENDENCIES
+      openr_kvstore_publication_filter
       openr_kvstore_util
       openr_kvstore_params
       openr_constants

@@ -668,6 +668,7 @@ if(BUILD_TESTS)
     SOURCE_GROUP_FILE cmake/modules/KvStore.cmake
     SOURCE_VARIABLES
       OPENR_KVSTORE_SOURCES
+      OPENR_KVSTORE_PUBLICATION_FILTER_SOURCES
       OPENR_KVSTORE_UTIL_SOURCES
       OPENR_KVSTORE_WRAPPER_SOURCES
       OPENR_KVSTORE_PEER_INGRESS_LIMIT_SOURCES
@@ -989,6 +990,7 @@ if(BUILD_TESTS)
       openr/kvstore/tests/KvStorePublisherTest.cpp
     LIBRARIES
       openr_kvstore
+      openr_kvstore_publication_filter
       openr_util
       glog::glog
       gflags

@@ -8,10 +8,11 @@
 #pragma once
 
 #include <openr/if/gen-cpp2/KvStore_types.h>
-#include <openr/kvstore/KvStoreUtil.h>
+#include <openr/kvstore/KvStorePublicationFilter.h>
 #include <thrift/lib/cpp2/async/ServerPublisherStream.h>
 
 namespace openr {
+
 class KvStorePublisher {
  public:
   KvStorePublisher(
@@ -34,14 +35,7 @@ class KvStorePublisher {
   }
 
  private:
-  thrift::KeyVals getFilteredKeyVals(const thrift::KeyVals& origKeyVals);
-  std::vector<std::string> getFilteredExpiredKeys(
-      const std::vector<std::string>& origExpiredKeys);
-
-  // set of areas whose updates should be published. If empty, publish all
-  std::set<std::string> selectAreas_;
-  thrift::KeyDumpParams filter_;
-  KvStoreFilters keyPrefixFilter_{{}, {}};
+  KvStorePublicationFilter filter_;
   apache::thrift::ServerStreamPublisher<thrift::Publication> publisher_;
 
  public:
