@@ -617,6 +617,17 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   }
 
   inline size_t
+  getNumKvStoreSnapshotsInFlight() {
+    return kvStoreStreams_->snapshotsInFlight();
+  }
+
+  // Call before any subscription.
+  inline void
+  setKvStoreStreamLimitsForTest(KvStoreStreamLimits limits) {
+    kvStoreStreamLimits_ = limits;
+  }
+
+  inline size_t
   getNumPendingLongPollReqs() {
     return longPollReqs_->size();
   }
@@ -680,6 +691,16 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   bool isKvStoreStreamLimitsEnabled() const;
 
   /*
+   * Admits a queue stream: checks the snapshot gate and the subscriber cap,
+   * then registers the subscriber. Above a limit, throws a Thrift
+   * LOADSHEDDING error, counts the reject by limit, and registers nothing;
+   * the connection stays open.
+   */
+  apache::thrift::ServerStream<thrift::Publication> admitKvStoreStream(
+      const thrift::KeyDumpParams& filter,
+      const std::set<std::string>& selectAreas);
+
+  /*
    * Stream of one subscriber on the Open/R-owned queue. The frame owns
    * `handle`; its destructor removes the subscriber.
    */
@@ -718,6 +739,9 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   // Open/R-owned KvStore stream queues (enable_ctrl_thrift_server_limits)
   const std::shared_ptr<KvStoreStreamRegistry> kvStoreStreams_{
       std::make_shared<KvStoreStreamRegistry>()};
+  KvStoreStreamLimits kvStoreStreamLimits_{
+      .maxSnapshotsInFlight = Constants::kKvStoreStreamMaxSnapshotsInFlight,
+      .maxSubscribers = Constants::kKvStoreStreamMaxSubscribers};
 
   // Active Fib streaming publishers
   folly::Synchronized<folly::F14FastMap<

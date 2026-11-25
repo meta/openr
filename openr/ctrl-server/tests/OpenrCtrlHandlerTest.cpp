@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <fb303/ServiceData.h>
+#include <folly/ScopeGuard.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/CurrentExecutor.h>
 #include <folly/coro/FutureUtil.h>
@@ -16,6 +17,7 @@
 #include <folly/coro/Timeout.h>
 #include <folly/init/Init.h>
 #include <folly/synchronization/Baton.h>
+#include <thrift/lib/cpp2/TrustedServerException.h>
 #include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include <openr/common/Constants.h>
@@ -2818,6 +2820,27 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetAreaKvStoresUpdateBeforeDump) {
   co_await checkUpdateBeforeDumpReachesStream();
 }
 
+/*
+ * With enable_ctrl_thrift_server_limits off, the admission limits do not
+ * apply: the publisher path serves the stream even with limits of zero.
+ */
+CO_TEST_F(OpenrCtrlFixture, StreamLimitsIgnoredWithKnobOff) {
+  handler_->setKvStoreStreamLimitsForTest(
+      {.maxSnapshotsInFlight = 0, .maxSubscribers = 0});
+  {
+    auto responseAndStream =
+        co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+            thrift::KeyDumpParams{}, kSpineOnlySet);
+    EXPECT_EQ(1, responseAndStream.response.size());
+    EXPECT_EQ(1, handler_->getNumKvStorePublishers());
+    EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  }
+  // The server removes the publisher on a Thrift thread.
+  while (numKvStoreSubscribers() != 0) {
+    std::this_thread::yield();
+  }
+}
+
 class OpenrCtrlStreamLimitsFixture : public OpenrCtrlFixture {
  protected:
   void
@@ -2870,6 +2893,125 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAndGetAreaKvStoresFromQueue) {
   }
 }
 
+/*
+ * Above the subscriber cap, the subscribe RPC fails with LOADSHEDDING and
+ * creates no subscriber. The connection keeps serving RPCs.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapReturnsLoadShedding) {
+  handler_->setKvStoreStreamLimitsForTest(
+      {.maxSnapshotsInFlight = 4, .maxSubscribers = 0});
+  auto& client = getOpenrCtrlClient();
+
+  auto rejected =
+      co_await folly::coro::co_awaitTry(client.co_subscribeAndGetAreaKvStores(
+          thrift::KeyDumpParams{}, kSpineOnlySet));
+
+  CO_ASSERT_TRUE(
+      rejected.hasException<apache::thrift::TApplicationException>());
+  EXPECT_EQ(
+      apache::thrift::TApplicationException::LOADSHEDDING,
+      rejected.exception()
+          .get_exception<apache::thrift::TApplicationException>()
+          ->getType());
+  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(nodeName_, co_await client.co_getMyNodeName());
+}
+
+// The subscriber cap counts every registered stream.
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscriberCapCountsStreams) {
+  handler_->setKvStoreStreamLimitsForTest(
+      {.maxSnapshotsInFlight = 4, .maxSubscribers = 2});
+  auto first = co_await handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet);
+  auto second =
+      co_await handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet);
+
+  auto rejected = co_await folly::coro::co_awaitTry(
+      handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet));
+
+  EXPECT_TRUE(rejected.hasException<apache::thrift::TrustedServerException>());
+  EXPECT_EQ(2, handler_->getNumKvStoreStreams());
+}
+
+/*
+ * The snapshot slot is taken at admission, before the KvStore dump: with a
+ * gate of 1, a second subscription fails with LOADSHEDDING while the first
+ * dump is still blocked on the KvStore event base. The admitted subscription
+ * then completes. Both calls start before the event base is released, so a
+ * gate that stops rejecting fails the assertion instead of hanging.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SnapshotGateReturnsLoadShedding) {
+  handler_->setKvStoreStreamLimitsForTest(
+      {.maxSnapshotsInFlight = 1, .maxSubscribers = 16});
+  folly::Baton<> kvStoreEvbHeld;
+  folly::Baton<> releaseKvStoreEvb;
+  kvStoreWrapper_->getKvStore()->runInEventBaseThread([&]() {
+    kvStoreEvbHeld.post();
+    releaseKvStoreEvb.wait();
+  });
+  kvStoreEvbHeld.wait();
+
+  auto* executor = co_await folly::coro::co_current_executor;
+  const auto start = [&]() {
+    return co_withExecutor(
+               folly::getKeepAliveToken(executor),
+               handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet))
+        .startInlineUnsafe();
+  };
+  auto [admittedFuture, rejectedFuture] = [&]() {
+    SCOPE_EXIT {
+      releaseKvStoreEvb.post();
+    };
+    // Each inline start returns at its first suspension point.
+    auto admittedStart = start();
+    EXPECT_EQ(1, handler_->getNumKvStoreSnapshotsInFlight());
+    auto rejectedStart = start();
+    return std::make_pair(std::move(admittedStart), std::move(rejectedStart));
+  }();
+
+  auto rejected = co_await folly::coro::co_awaitTry(
+      folly::coro::toTask(std::move(rejectedFuture)));
+  CO_ASSERT_TRUE(
+      rejected.hasException<apache::thrift::TrustedServerException>());
+  EXPECT_EQ(
+      apache::thrift::TApplicationException::LOADSHEDDING,
+      rejected.exception()
+          .get_exception<apache::thrift::TrustedServerException>()
+          ->toApplicationException()
+          .getType());
+  auto admitted = co_await folly::coro::toTask(std::move(admittedFuture));
+  EXPECT_EQ(1, admitted.response.size());
+  EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+}
+
+/*
+ * The generator's first pull releases the snapshot slot. With a gate of 1,
+ * the first stream delivers an update to the Thrift client, so its generator
+ * pulled; the slot is free and a second subscription is admitted.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, FirstPullReleasesSnapshotSlot) {
+  handler_->setKvStoreStreamLimitsForTest(
+      {.maxSnapshotsInFlight = 1, .maxSubscribers = 16});
+  auto& client = getOpenrCtrlClient();
+  const std::string key{"key1"};
+  const auto value = createThriftValue(1, "node1", std::string("value1"));
+
+  auto first = co_await client.co_subscribeAndGetAreaKvStores(
+      thrift::KeyDumpParams{}, kSpineOnlySet);
+  auto gen = std::move(first.stream).toAsyncGenerator();
+  kvStoreWrapper_->setKey(kSpineAreaId, key, value, std::nullopt);
+  auto pub =
+      co_await folly::coro::timeout(gen.next(), kKvStorePublicationTimeout);
+  CO_ASSERT_TRUE(pub.has_value());
+  CO_ASSERT_EQ(1, pub->keyVals()->count(key));
+  EXPECT_EQ(0, handler_->getNumKvStoreSnapshotsInFlight());
+
+  auto second = co_await client.co_subscribeAndGetAreaKvStores(
+      thrift::KeyDumpParams{}, kSpineOnlySet);
+  CO_ASSERT_EQ(1, second.response.size());
+  EXPECT_EQ(1, second.response.front().keyVals()->count(key));
+  EXPECT_EQ(2, handler_->getNumKvStoreStreams());
+}
+
 // Handler shutdown ends each queue stream with "publisher terminated".
 CO_TEST_F(OpenrCtrlStreamLimitsFixture, StopEndsQueueStreams) {
   auto responseAndStream =
@@ -2908,19 +3050,22 @@ CO_TEST_F(OpenrCtrlStreamLimitsFixture, CancelRemovesQueueStream) {
 }
 
 /*
- * A registered queue stream that the handler never returns, as when the
- * KvStore dump throws after registration, removes its subscriber when the
- * stream is destroyed. The dump does not fail on an unknown area (it skips
- * it), so the test drops the stream that subscribeKvStoreFilter() returns.
+ * An admitted queue stream that Thrift never starts, as when the KvStore dump
+ * throws after admission, removes its subscriber and releases its snapshot
+ * slot when the stream is destroyed. The KvStore dump does not fail on an
+ * unknown area (it skips it), so the test drops the stream that
+ * co_subscribeAndDumpKvStore() returns, as unwinding does.
  */
-TEST_F(OpenrCtrlStreamLimitsFixture, UnreturnedQueueStreamRemovesSubscriber) {
+CO_TEST_F(
+    OpenrCtrlStreamLimitsFixture, UnreturnedQueueStreamRemovesSubscriber) {
   {
-    auto stream = handler_->subscribeKvStoreFilter(
-        std::make_unique<thrift::KeyDumpParams>(),
-        std::make_unique<std::set<std::string>>(kSpineOnlySet));
+    auto responseAndStream =
+        co_await handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet);
     EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+    EXPECT_EQ(1, handler_->getNumKvStoreSnapshotsInFlight());
   }
   EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(0, handler_->getNumKvStoreSnapshotsInFlight());
 }
 
 /*

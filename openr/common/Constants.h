@@ -424,6 +424,28 @@ class Constants {
   static constexpr size_t kKvStoreStreamSendQuotaBytes{2 * 1024 * 1024};
 
   /*
+   * KvStore stream admission, applied with enable_ctrl_thrift_server_limits.
+   * Open/R checks both limits before it registers a subscriber, and
+   * rejects a subscription above either limit with a Thrift LOADSHEDDING
+   * error. EB devices hold one stream subscriber today; DC devices hold none.
+   *
+   * Snapshots from admission until Thrift starts their stream (the first
+   * response is queued for write and the client has credit). A snapshot is
+   * the RPC response and counts against no stream budget, so this gate
+   * bounds them.
+   */
+  static constexpr size_t kKvStoreStreamMaxSnapshotsInFlight{4};
+  // Concurrent KvStore stream subscribers
+  static constexpr size_t kKvStoreStreamMaxSubscribers{16};
+  /*
+   * A snapshot slot held this long after admission is reclaimed when the gate
+   * is full: a client that grants no credit after the first response would
+   * otherwise hold it until Thrift's stream starvation timeout (60s). Equal
+   * to kOpenrCtrlThriftSocketWriteTimeout.
+   */
+  static constexpr std::chrono::seconds kKvStoreStreamSnapshotSlotTimeout{15};
+
+  /*
    *
    * See https://github.com/facebook/openr/blob/master/openr/docs/Versions.md
    * for details of version history

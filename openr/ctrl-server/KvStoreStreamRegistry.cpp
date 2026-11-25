@@ -18,6 +18,7 @@
 
 #include <fb303/ServiceData.h>
 
+#include <openr/common/Constants.h>
 #include <openr/common/Util.h>
 #include <openr/if/gen-cpp2/KvStore_types_custom_protocol.h>
 
@@ -26,6 +27,8 @@ namespace openr {
 namespace {
 
 constexpr std::string_view kSubscribersCounter{"subscribers.kvstore"};
+constexpr std::string_view kSnapshotSlotReclaimsStat{
+    "subscribers.kvstore.snapshot_slot_reclaims"};
 
 size_t
 serializedSize(const thrift::Publication& pub) {
@@ -156,6 +159,16 @@ KvStoreStreamHandle::KvStoreStreamHandle(
     std::shared_ptr<KvStoreStreamSubscriber> subscriber)
     : registry_(std::move(registry)), subscriber_(std::move(subscriber)) {}
 
+void
+KvStoreStreamHandle::releaseSnapshotSlot() {
+  if (!subscriber_) {
+    return;
+  }
+  if (auto registry = registry_.lock()) {
+    registry->releaseSnapshotSlot(subscriber_->id);
+  }
+}
+
 KvStoreStreamHandle::~KvStoreStreamHandle() {
   if (!subscriber_) {
     return;
@@ -165,33 +178,100 @@ KvStoreStreamHandle::~KvStoreStreamHandle() {
   }
 }
 
-KvStoreStreamHandle
-KvStoreStreamRegistry::add(int64_t id, KvStorePublicationFilter filter) {
+folly::Expected<KvStoreStreamHandle, KvStoreStreamRejection>
+KvStoreStreamRegistry::tryAdd(
+    int64_t id,
+    KvStorePublicationFilter filter,
+    const KvStoreStreamLimits& limits,
+    std::chrono::steady_clock::time_point now) {
   auto subscriber =
       std::make_shared<KvStoreStreamSubscriber>(id, std::move(filter));
-  const bool added = state_.withWLock([&](auto& state) {
+  enum class Admission { ADMITTED, CLOSED, REJECTED };
+  KvStoreStreamRejection rejection;
+  std::vector<int64_t> reclaimed;
+  const auto admission = state_.withWLock([&](auto& state) {
     if (state.closeReason) {
       // The handler stopped: the dispatcher no longer feeds the registry.
       subscriber->queue.close(state.closeReason);
-      return false;
+      return Admission::CLOSED;
     }
+    if (state.snapshotsInFlight >= limits.maxSnapshotsInFlight) {
+      /*
+       * A client that grants no credit after the first response keeps Thrift
+       * from starting its stream; reclaim the slots held that long.
+       */
+      for (auto& [otherId, other] : state.subscribers) {
+        if (other->holdsSnapshotSlot &&
+            now - other->admissionTime >=
+                Constants::kKvStoreStreamSnapshotSlotTimeout) {
+          other->holdsSnapshotSlot = false;
+          --state.snapshotsInFlight;
+          reclaimed.push_back(otherId);
+        }
+      }
+    }
+    rejection.snapshotsInFlight = state.snapshotsInFlight;
+    rejection.subscribers = state.subscribers.size();
+    if (state.snapshotsInFlight >= limits.maxSnapshotsInFlight) {
+      rejection.reason = KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT;
+      return Admission::REJECTED;
+    }
+    if (state.subscribers.size() >= limits.maxSubscribers) {
+      rejection.reason = KvStoreStreamRejection::Reason::SUBSCRIBERS;
+      return Admission::REJECTED;
+    }
+    ++state.snapshotsInFlight;
+    subscriber->admissionTime = now;
     state.subscribers.emplace(id, subscriber);
     facebook::fb303::fbData->setCounter(
         kSubscribersCounter, state.subscribers.size());
-    return true;
+    return Admission::ADMITTED;
   });
-  if (added) {
-    XLOGF(INFO, "KvStore stream-{} started.", id);
-  } else {
+  for (const auto reclaimedId : reclaimed) {
+    ++snapshotSlotReclaims_;
+    facebook::fb303::fbData->addStatValue(
+        kSnapshotSlotReclaimsStat, 1, facebook::fb303::COUNT);
+    XLOGF(
+        WARNING,
+        "KvStore stream-{} lost its snapshot slot: not started within {}s of "
+        "admission",
+        reclaimedId,
+        Constants::kKvStoreStreamSnapshotSlotTimeout.count());
+  }
+  if (admission == Admission::REJECTED) {
+    return folly::makeUnexpected(rejection);
+  }
+  if (admission == Admission::CLOSED) {
     XLOGF(INFO, "KvStore stream-{} closed at once: the handler stopped.", id);
+  } else {
+    XLOGF(INFO, "KvStore stream-{} started.", id);
   }
   return KvStoreStreamHandle(weak_from_this(), std::move(subscriber));
 }
 
 void
+KvStoreStreamRegistry::releaseSnapshotSlot(int64_t id) {
+  state_.withWLock([&](auto& state) {
+    auto it = state.subscribers.find(id);
+    if (it == state.subscribers.end() || !it->second->holdsSnapshotSlot) {
+      return;
+    }
+    it->second->holdsSnapshotSlot = false;
+    --state.snapshotsInFlight;
+  });
+}
+
+void
 KvStoreStreamRegistry::remove(int64_t id) {
   state_.withWLock([&](auto& state) {
-    state.subscribers.erase(id);
+    auto it = state.subscribers.find(id);
+    if (it == state.subscribers.end()) {
+      return;
+    }
+    if (it->second->holdsSnapshotSlot) {
+      --state.snapshotsInFlight;
+    }
+    state.subscribers.erase(it);
     facebook::fb303::fbData->setCounter(
         kSubscribersCounter, state.subscribers.size());
   });
@@ -268,6 +348,11 @@ KvStoreStreamRegistry::closeAll(const folly::exception_wrapper& reason) {
 size_t
 KvStoreStreamRegistry::size() const {
   return state_.rlock()->subscribers.size();
+}
+
+size_t
+KvStoreStreamRegistry::snapshotsInFlight() const {
+  return state_.rlock()->snapshotsInFlight;
 }
 
 std::vector<thrift::StreamSubscriberInfo>

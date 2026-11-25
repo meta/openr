@@ -23,6 +23,7 @@ macro(openr_add_ctrl_server_library)
     SOURCES ${OPENR_KVSTORE_STREAM_REGISTRY_SOURCES}
     PRIVATE_DEPENDENCIES
       fb303::fb303
+      openr_constants
       openr_util
     PUBLIC_DEPENDENCIES
       openr_kvstore_publication_filter

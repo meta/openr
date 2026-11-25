@@ -13,6 +13,7 @@ namespace fs = std::filesystem;
 
 #include <folly/ExceptionString.h>
 #include <folly/logging/xlog.h>
+#include <thrift/lib/cpp2/TrustedServerException.h>
 
 #include <openr/common/Constants.h>
 #include <openr/common/LsdbUtil.h>
@@ -28,6 +29,8 @@ namespace openr {
 namespace {
 
 constexpr auto kKvStoreNotInitializedError = "KvStore is not initialized";
+// At most one admission-reject warning per interval.
+constexpr int64_t kKvStoreStreamRejectLogIntervalMs{10'000};
 
 std::unique_ptr<std::vector<thrift::UnicastRouteDetail>>
 toUnicastRouteDetails(
@@ -1246,17 +1249,6 @@ OpenrCtrlHandler::subscribeKvStoreFilter(
   // Get new client-ID (monotonically increasing)
   auto clientToken = publisherToken_++;
 
-  if (isKvStoreStreamLimitsEnabled()) {
-    XLOGF(
-        INFO,
-        "KvStore stream-{} requested for areas: {}",
-        clientToken,
-        folly::join(", ", *selectAreas));
-    return streamKvStore(kvStoreStreams_->add(
-        clientToken,
-        KvStorePublicationFilter(*selectAreas, std::move(*filter))));
-  }
-
   auto streamAndPublisher =
       apache::thrift::ServerStream<thrift::Publication>::createPublisher(
           [this, clientToken]() {
@@ -1343,9 +1335,11 @@ OpenrCtrlHandler::co_subscribeAndDumpKvStore(
     throw thrift::KvStoreError(kKvStoreNotInitializedError);
   }
 
-  auto stream = subscribeKvStoreFilter(
-      std::make_unique<thrift::KeyDumpParams>(filter),
-      std::make_unique<std::set<std::string>>(selectAreas));
+  auto stream = isKvStoreStreamLimitsEnabled()
+      ? admitKvStoreStream(filter, selectAreas)
+      : subscribeKvStoreFilter(
+            std::make_unique<thrift::KeyDumpParams>(filter),
+            std::make_unique<std::set<std::string>>(selectAreas));
   auto pubs = co_await kvStore_->co_dumpKvStoreKeys(
       std::move(filter), std::move(selectAreas));
   for (auto& pub : *pubs) {
@@ -1361,8 +1355,61 @@ OpenrCtrlHandler::isKvStoreStreamLimitsEnabled() const {
   return config_ && config_->isCtrlThriftServerLimitsEnabled();
 }
 
+apache::thrift::ServerStream<thrift::Publication>
+OpenrCtrlHandler::admitKvStoreStream(
+    const thrift::KeyDumpParams& filter,
+    const std::set<std::string>& selectAreas) {
+  const auto clientToken = publisherToken_++;
+  auto handle = kvStoreStreams_->tryAdd(
+      clientToken,
+      KvStorePublicationFilter(selectAreas, filter),
+      kvStoreStreamLimits_);
+  if (!handle) {
+    const auto& rejection = handle.error();
+    const bool snapshots =
+        rejection.reason == KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT;
+    facebook::fb303::fbData->addStatValue(
+        "subscribers.kvstore.subscribe_rejects", 1, facebook::fb303::COUNT);
+    facebook::fb303::fbData->addStatValue(
+        snapshots ? "subscribers.kvstore.subscribe_rejects.snapshots"
+                  : "subscribers.kvstore.subscribe_rejects.subscribers",
+        1,
+        facebook::fb303::COUNT);
+    auto message = fmt::format(
+        "KvStore stream admission limit reached: {} ({} of {} snapshots in "
+        "flight, {} of {} subscribers)",
+        snapshots ? "snapshots in flight" : "subscribers",
+        rejection.snapshotsInFlight,
+        kvStoreStreamLimits_.maxSnapshotsInFlight,
+        rejection.subscribers,
+        kvStoreStreamLimits_.maxSubscribers);
+    XLOGF_EVERY_MS(
+        WARNING,
+        kKvStoreStreamRejectLogIntervalMs,
+        "KvStore stream-{} rejected: {}",
+        clientToken,
+        message);
+    /*
+     * The app-overload error keeps its type on the wire: the client receives
+     * a TApplicationException of type LOADSHEDDING.
+     */
+    throw apache::thrift::TrustedServerException::appOverloadError(message);
+  }
+  XLOGF(
+      INFO,
+      "KvStore stream-{} admitted for areas: {}",
+      clientToken,
+      folly::join(", ", selectAreas));
+  return streamKvStore(std::move(*handle));
+}
+
 folly::coro::AsyncGenerator<thrift::Publication&&>
 OpenrCtrlHandler::streamKvStore(KvStoreStreamHandle handle) {
+  /*
+   * First pull: Thrift starts the stream once the snapshot (the first
+   * response) is queued for write and the client has credit.
+   */
+  handle.releaseSnapshotSlot();
   while (true) {
     co_yield co_await handle.queue().pop();
   }

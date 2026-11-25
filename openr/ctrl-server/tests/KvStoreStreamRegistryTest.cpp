@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <chrono>
 #include <optional>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
+#include <openr/common/Constants.h>
 #include <openr/common/Util.h>
 #include <openr/ctrl-server/KvStoreStreamRegistry.h>
 
@@ -60,6 +62,20 @@ keysOf(const thrift::Publication& pub) {
     keys.insert(key);
   }
   return keys;
+}
+
+constexpr KvStoreStreamLimits kNoLimits{
+    .maxSnapshotsInFlight = 100, .maxSubscribers = 100};
+
+KvStoreStreamHandle
+add(KvStoreStreamRegistry& registry,
+    int64_t id,
+    KvStorePublicationFilter filter) {
+  auto handle = registry.tryAdd(id, std::move(filter), kNoLimits);
+  if (!handle) {
+    throw std::logic_error("tryAdd() rejected a subscriber below the limits");
+  }
+  return std::move(*handle);
 }
 
 folly::exception_wrapper
@@ -126,11 +142,13 @@ sequence(int64_t count) {
  */
 CO_TEST(KvStoreStreamRegistryTest, FanOutAppliesEachFilter) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto all1 = registry->add(1, allKeysFilter());
-  auto all2 = registry->add(2, allKeysFilter());
-  auto filtered = registry->add(3, keysFilter({"prefix:a"}));
-  auto otherArea = registry->add(
-      4, KvStorePublicationFilter({"area2"}, thrift::KeyDumpParams{}));
+  auto all1 = add(*registry, 1, allKeysFilter());
+  auto all2 = add(*registry, 2, allKeysFilter());
+  auto filtered = add(*registry, 3, keysFilter({"prefix:a"}));
+  auto otherArea =
+      add(*registry,
+          4,
+          KvStorePublicationFilter({"area2"}, thrift::KeyDumpParams{}));
 
   registry->fanOut(makePublication({"prefix:a", "adj:b"}));
 
@@ -149,7 +167,7 @@ CO_TEST(KvStoreStreamRegistryTest, FanOutAppliesEachFilter) {
  */
 CO_TEST(KvStoreStreamRegistryTest, FanOutPassesPublicationThroughUnfiltered) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
   auto ttlUpdate = makePublication({"prefix:a"});
   ttlUpdate.keyVals()->emplace(
       "adj:b",
@@ -192,17 +210,17 @@ TEST(KvStoreStreamRegistryTest, FanOutSharesOneCopyPerKeyFilter) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
   thrift::KeyDumpParams prefixParams;
   prefixParams.keys() = {"prefix:a"};
-  auto prefix1 = registry->add(1, keysFilter({"prefix:a"}));
-  auto prefix2 = registry->add(
-      2, KvStorePublicationFilter({kArea, "area2"}, prefixParams));
-  auto adj = registry->add(3, keysFilter({"adj:b"}));
+  auto prefix1 = add(*registry, 1, keysFilter({"prefix:a"}));
+  auto prefix2 = add(
+      *registry, 2, KvStorePublicationFilter({kArea, "area2"}, prefixParams));
+  auto adj = add(*registry, 3, keysFilter({"adj:b"}));
   // Default params ignore TTL updates, so they do not keep all keys.
-  auto default1 = registry->add(4, KvStorePublicationFilter({kArea}, {}));
-  auto default2 = registry->add(5, KvStorePublicationFilter({kArea}, {}));
-  auto all1 = registry->add(6, allKeysFilter());
-  auto all2 = registry->add(7, allKeysFilter());
-  auto none1 = registry->add(8, keysFilter({"none"}));
-  auto none2 = registry->add(9, keysFilter({"none"}));
+  auto default1 = add(*registry, 4, KvStorePublicationFilter({kArea}, {}));
+  auto default2 = add(*registry, 5, KvStorePublicationFilter({kArea}, {}));
+  auto all1 = add(*registry, 6, allKeysFilter());
+  auto all2 = add(*registry, 7, allKeysFilter());
+  auto none1 = add(*registry, 8, keysFilter({"none"}));
+  auto none2 = add(*registry, 9, keysFilter({"none"}));
 
   registry->fanOut(makePublication({"prefix:a", "adj:b"}));
 
@@ -227,7 +245,7 @@ TEST(KvStoreStreamRegistryTest, FanOutSharesOneCopyPerKeyFilter) {
 // A publication without a matching key queues no message.
 TEST(KvStoreStreamRegistryTest, FanOutSkipsUnmatchedPublication) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto filtered = registry->add(1, keysFilter({"prefix:a"}));
+  auto filtered = add(*registry, 1, keysFilter({"prefix:a"}));
 
   registry->fanOut(makePublication({"adj:b"}));
 
@@ -238,7 +256,7 @@ TEST(KvStoreStreamRegistryTest, FanOutSkipsUnmatchedPublication) {
 // pop() suspends on an empty queue and resumes at the next publication.
 CO_TEST(KvStoreStreamRegistryTest, PopWaitsForFanOut) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
 
   auto [pub, _] = co_await folly::coro::collectAll(
       handle.queue().pop(), [&]() -> folly::coro::Task<void> {
@@ -252,7 +270,7 @@ CO_TEST(KvStoreStreamRegistryTest, PopWaitsForFanOut) {
 // Queued bytes follow the queued messages; sent messages count the pops.
 CO_TEST(KvStoreStreamRegistryTest, QueuedBytesFollowMessages) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
 
   registry->fanOut(makePublication({"key1"}));
   registry->fanOut(makePublication({"key1", "key2"}));
@@ -273,7 +291,7 @@ CO_TEST(KvStoreStreamRegistryTest, QueuedBytesFollowMessages) {
 // closeAll() drops the queued messages and ends pop() with the reason.
 CO_TEST(KvStoreStreamRegistryTest, CloseAllEndsPop) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
   registry->fanOut(makePublication({"key1"}));
 
   registry->closeAll(terminated());
@@ -290,7 +308,7 @@ CO_TEST(KvStoreStreamRegistryTest, CloseAllEndsPop) {
 // A queue closed while pop() waits ends that pop().
 CO_TEST(KvStoreStreamRegistryTest, CloseAllWakesWaitingPop) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
 
   auto result = co_await folly::coro::co_awaitTry(
       folly::coro::collectAll(
@@ -305,7 +323,7 @@ CO_TEST(KvStoreStreamRegistryTest, CloseAllWakesWaitingPop) {
 // Cancellation of the stream ends a waiting pop().
 CO_TEST(KvStoreStreamRegistryTest, CancellationEndsWaitingPop) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = add(*registry, 1, allKeysFilter());
   folly::CancellationSource cancel;
 
   auto result = co_await folly::coro::co_awaitTry(
@@ -321,20 +339,24 @@ CO_TEST(KvStoreStreamRegistryTest, CancellationEndsWaitingPop) {
 }
 
 /*
- * A subscriber that registers after closeAll(), as when a subscription
- * races with the handler stop, is not registered and its pop() ends with
- * the closeAll() reason.
+ * A subscriber that arrives after closeAll(), as when a subscription races
+ * with the handler stop, gets a handle even at the limits: it is not
+ * registered, takes no snapshot slot, and its pop() ends with the closeAll()
+ * reason.
  */
 CO_TEST(KvStoreStreamRegistryTest, AddAfterCloseAllClosesQueue) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
   registry->closeAll(terminated());
 
-  auto handle = registry->add(1, allKeysFilter());
+  auto handle = registry->tryAdd(
+      1, allKeysFilter(), {.maxSnapshotsInFlight = 0, .maxSubscribers = 0});
+  CO_ASSERT_TRUE(handle.hasValue());
   registry->fanOut(makePublication({"key1"}));
 
   EXPECT_EQ(0, registry->size());
-  EXPECT_EQ(0, handle.queue().queuedMessages());
-  auto result = co_await folly::coro::co_awaitTry(handle.queue().pop());
+  EXPECT_EQ(0, registry->snapshotsInFlight());
+  EXPECT_EQ(0, handle->queue().queuedMessages());
+  auto result = co_await folly::coro::co_awaitTry(handle->queue().pop());
   CO_ASSERT_TRUE(result.hasException<std::runtime_error>());
   EXPECT_STREQ(
       "publisher terminated",
@@ -364,7 +386,7 @@ TEST(KvStoreStreamRegistryTest, ConcurrentFanOutPopAndRemove) {
     return folly::coro::co_withExecutor(
                folly::getKeepAliveToken(executor),
                consume(
-                   registry->add(id, std::move(filter)),
+                   add(*registry, id, std::move(filter)),
                    numKeys,
                    count,
                    awaitClose,
@@ -400,7 +422,7 @@ TEST(KvStoreStreamRegistryTest, ConcurrentFanOutPopAndRemove) {
 TEST(KvStoreStreamRegistryTest, HandleRemovesSubscriber) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
   {
-    auto handle = registry->add(1, allKeysFilter());
+    auto handle = add(*registry, 1, allKeysFilter());
     auto moved = std::move(handle);
     EXPECT_EQ(1, registry->size());
   }
@@ -420,7 +442,7 @@ CO_TEST(KvStoreStreamRegistryTest, HandleOutlivesRegistry) {
   {
     auto registry = std::make_shared<KvStoreStreamRegistry>();
     weakRegistry = registry;
-    handle.emplace(registry->add(1, allKeysFilter()));
+    handle.emplace(add(*registry, 1, allKeysFilter()));
     registry->fanOut(makePublication({"key1"}));
   }
   CO_ASSERT_TRUE(weakRegistry.expired());
@@ -438,8 +460,8 @@ CO_TEST(KvStoreStreamRegistryTest, HandleOutlivesRegistry) {
 // Subscriber info reports the id and the messages each stream sent.
 CO_TEST(KvStoreStreamRegistryTest, SubscriberInfoCountsSentMessages) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
-  auto sender = registry->add(7, allKeysFilter());
-  auto filtered = registry->add(8, keysFilter({"prefix:a"}));
+  auto sender = add(*registry, 7, allKeysFilter());
+  auto filtered = add(*registry, 8, keysFilter({"prefix:a"}));
   registry->fanOut(makePublication({"adj:b"}));
   co_await sender.queue().pop();
 
@@ -451,6 +473,136 @@ CO_TEST(KvStoreStreamRegistryTest, SubscriberInfoCountsSentMessages) {
   }
   const std::map<int64_t, int64_t> expected{{7, 1}, {8, 0}};
   EXPECT_EQ(expected, sentById);
+}
+
+/*
+ * Above the snapshot gate, tryAdd() registers nothing and reports the gate
+ * with the counts it saw, until a slot is released.
+ */
+TEST(KvStoreStreamRegistryTest, SnapshotGateRejectsAboveLimit) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  const KvStoreStreamLimits limits{
+      .maxSnapshotsInFlight = 2, .maxSubscribers = 16};
+  auto first = registry->tryAdd(1, allKeysFilter(), limits);
+  auto second = registry->tryAdd(2, allKeysFilter(), limits);
+  ASSERT_TRUE(first.hasValue());
+  ASSERT_TRUE(second.hasValue());
+
+  auto rejected = registry->tryAdd(3, allKeysFilter(), limits);
+  ASSERT_TRUE(rejected.hasError());
+  EXPECT_EQ(
+      KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT,
+      rejected.error().reason);
+  EXPECT_EQ(2, rejected.error().snapshotsInFlight);
+  EXPECT_EQ(2, rejected.error().subscribers);
+  EXPECT_EQ(2, registry->size());
+  EXPECT_EQ(2, registry->snapshotsInFlight());
+
+  first->releaseSnapshotSlot();
+  first->releaseSnapshotSlot();
+  EXPECT_EQ(1, registry->snapshotsInFlight());
+  EXPECT_TRUE(registry->tryAdd(3, allKeysFilter(), limits).hasValue());
+  EXPECT_EQ(0, registry->snapshotSlotReclaims());
+}
+
+// Above the subscriber cap, tryAdd() registers nothing and reports the cap.
+TEST(KvStoreStreamRegistryTest, SubscriberCapRejectsAboveLimit) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  const KvStoreStreamLimits limits{
+      .maxSnapshotsInFlight = 4, .maxSubscribers = 2};
+  auto first = registry->tryAdd(1, allKeysFilter(), limits);
+  auto second = registry->tryAdd(2, allKeysFilter(), limits);
+  ASSERT_TRUE(first.hasValue());
+  ASSERT_TRUE(second.hasValue());
+  first->releaseSnapshotSlot();
+  second->releaseSnapshotSlot();
+
+  auto rejected = registry->tryAdd(3, allKeysFilter(), limits);
+  ASSERT_TRUE(rejected.hasError());
+  EXPECT_EQ(
+      KvStoreStreamRejection::Reason::SUBSCRIBERS, rejected.error().reason);
+  EXPECT_EQ(0, rejected.error().snapshotsInFlight);
+  EXPECT_EQ(2, rejected.error().subscribers);
+  EXPECT_EQ(2, registry->size());
+}
+
+/*
+ * With the gate full, tryAdd() reclaims the slots admitted at least
+ * kKvStoreStreamSnapshotSlotTimeout earlier. Their subscribers stay
+ * registered, and a later release or removal does not count them again.
+ */
+TEST(KvStoreStreamRegistryTest, FullGateReclaimsExpiredSnapshotSlots) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  const KvStoreStreamLimits limits{
+      .maxSnapshotsInFlight = 2, .maxSubscribers = 16};
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto timeout = Constants::kKvStoreStreamSnapshotSlotTimeout;
+  std::optional<KvStoreStreamHandle> stuck;
+  std::optional<KvStoreStreamHandle> recent;
+  {
+    auto first = registry->tryAdd(1, allKeysFilter(), limits, t0);
+    auto second = registry->tryAdd(
+        2, allKeysFilter(), limits, t0 + std::chrono::seconds(1));
+    ASSERT_TRUE(first.hasValue());
+    ASSERT_TRUE(second.hasValue());
+    stuck.emplace(std::move(*first));
+    recent.emplace(std::move(*second));
+  }
+
+  // One second short of the timeout: nothing is reclaimed.
+  auto early = registry->tryAdd(
+      3, allKeysFilter(), limits, t0 + timeout - std::chrono::seconds(1));
+  ASSERT_TRUE(early.hasError());
+  EXPECT_EQ(
+      KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT,
+      early.error().reason);
+  EXPECT_EQ(0, registry->snapshotSlotReclaims());
+
+  // At the timeout, only the oldest slot is reclaimed.
+  auto admitted = registry->tryAdd(4, allKeysFilter(), limits, t0 + timeout);
+  ASSERT_TRUE(admitted.hasValue());
+  EXPECT_EQ(1, registry->snapshotSlotReclaims());
+  EXPECT_EQ(3, registry->size());
+  EXPECT_EQ(2, registry->snapshotsInFlight());
+
+  stuck->releaseSnapshotSlot();
+  EXPECT_EQ(2, registry->snapshotsInFlight());
+  stuck.reset();
+  EXPECT_EQ(2, registry->size());
+  EXPECT_EQ(2, registry->snapshotsInFlight());
+  recent.reset();
+  EXPECT_EQ(1, registry->size());
+  EXPECT_EQ(1, registry->snapshotsInFlight());
+}
+
+// Below the gate, tryAdd() reclaims nothing, however old the slots are.
+TEST(KvStoreStreamRegistryTest, GateBelowLimitReclaimsNothing) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  const KvStoreStreamLimits limits{
+      .maxSnapshotsInFlight = 2, .maxSubscribers = 16};
+  const auto t0 = std::chrono::steady_clock::now();
+  auto old = registry->tryAdd(1, allKeysFilter(), limits, t0);
+  ASSERT_TRUE(old.hasValue());
+
+  auto next = registry->tryAdd(
+      2,
+      allKeysFilter(),
+      limits,
+      t0 + 10 * Constants::kKvStoreStreamSnapshotSlotTimeout);
+  ASSERT_TRUE(next.hasValue());
+  EXPECT_EQ(0, registry->snapshotSlotReclaims());
+  EXPECT_EQ(2, registry->snapshotsInFlight());
+}
+
+// A subscriber removed before its first pull releases its snapshot slot.
+TEST(KvStoreStreamRegistryTest, RemoveReleasesSnapshotSlot) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  {
+    auto handle = add(*registry, 1, allKeysFilter());
+    EXPECT_EQ(1, registry->snapshotsInFlight());
+  }
+  EXPECT_EQ(0, registry->snapshotsInFlight());
+  EXPECT_EQ(0, registry->size());
 }
 
 } // namespace openr
