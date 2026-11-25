@@ -13,6 +13,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <folly/CppAttributes.h>
 #include <folly/container/F14Map.h>
@@ -20,6 +22,20 @@
 #include <openr/if/gen-cpp2/KvStore_types.h>
 
 namespace openr {
+
+/*
+ * One queued KvStore stream message. The queues of subscribers with the same
+ * key filter reference one Publication; `shared` is then true and nothing
+ * modifies it once queued. A message that one queue alone references
+ * (`shared` false) is moved out by that queue's pop(). `bytes` is its
+ * Compact serialized size. Example: about 1100 for a Publication with one
+ * 1 KB value.
+ */
+struct KvStoreStreamMessage {
+  std::shared_ptr<thrift::Publication> publication;
+  size_t bytes{0};
+  bool shared{false};
+};
 
 /*
  * The merged updates of one KvStore stream queue in merge mode. Folds
@@ -38,18 +54,26 @@ namespace openr {
  *
  * A TTL refresh onto a queued value keeps the value and takes the new TTL.
  *
+ * Values of a shared message stay in its Publication: the entry points to
+ * the value, and the buffer holds a reference to the Publication (a pin)
+ * while any entry points into it. The queues of subscribers with the same
+ * key filter thus keep one copy of each value in merge mode as well. A TTL
+ * refresh onto such a value is kept beside it and applied at pop(). Values
+ * of an unshared message are moved into the buffer.
+ *
  * Two byte counts: bytes() is the serialized size of the entries, which the
- * per-stream limit and the merge thresholds compare; budgetBytes() adds
- * Constants::kKvStoreStreamMergedEntryOverheadBytes per entry as an estimate
- * of the memory the entries take. The buffer charges budgetBytes() to
- * `budget` and releases it as entries leave or the buffer is destroyed. Not
- * thread-safe: the queue lock guards it.
+ * per-stream limit and the merge thresholds compare; budgetBytes() is the
+ * memory the buffer charges to `budget`: the serialized entries it owns,
+ * the keys of entries that point into a pinned Publication (the Publication
+ * charges its values), and Constants::kKvStoreStreamMergedEntryOverheadBytes
+ * per entry. The buffer releases its charge as entries leave or the buffer
+ * is destroyed. Not thread-safe: the queue lock guards it.
  */
 class KvStoreStreamMergeBuffer {
  public:
   explicit KvStoreStreamMergeBuffer(
       std::shared_ptr<std::atomic<size_t>> budget);
-  // Takes the entries and their charge; `other` is left empty.
+  // Takes the entries, the pins and the charge; `other` is left empty.
   KvStoreStreamMergeBuffer(KvStoreStreamMergeBuffer&& other) noexcept;
   KvStoreStreamMergeBuffer& operator=(KvStoreStreamMergeBuffer&&) = delete;
   KvStoreStreamMergeBuffer(const KvStoreStreamMergeBuffer&) = delete;
@@ -57,22 +81,29 @@ class KvStoreStreamMergeBuffer {
   ~KvStoreStreamMergeBuffer();
 
   /*
-   * Folds the keyVals and expiredKeys of `pub`; drops its other fields.
-   * Returns true when it started a segment: the area had no open segment, or
-   * a value of `pub` meets a queued expiry. A Publication without keys folds
-   * nothing.
+   * Folds the keyVals and expiredKeys of `message`; drops its other fields.
+   * Points to the values of a shared message and moves the values out of an
+   * unshared one. Returns true when it started a segment: the area had no
+   * open segment, or a value of the message meets a queued expiry. A
+   * Publication without keys folds nothing.
    */
-  [[nodiscard]] bool add(const thrift::Publication& pub);
+  [[nodiscard]] bool add(const KvStoreStreamMessage& message);
 
   /*
    * Moves entries of the oldest segment out as a Publication of its area,
-   * until the next entry would take their budget bytes (overhead included)
-   * above `maxBytes`; always at least one. Entries left in the segment stay
-   * first in line. Requires !empty(). Example: with maxBytes = 1 MiB and
-   * three entries of 600 KB, it returns one entry; the next two pops return
-   * one each.
+   * until the next entry would take their serialized bytes plus overhead
+   * above `maxBytes`; always at least one. Copies a value that points into a
+   * pinned Publication. Entries left in the segment stay first in line.
+   * Requires !empty(). Example: with maxBytes = 1 MiB and three entries of
+   * 600 KB, it returns one entry; the next two pops return one each.
    */
   thrift::Publication pop(size_t maxBytes);
+
+  /*
+   * The pins that no entry uses any more, so the caller frees the
+   * Publications after it releases the queue lock.
+   */
+  std::vector<std::shared_ptr<thrift::Publication>> takeReleased();
 
   bool
   empty() const {
@@ -96,11 +127,22 @@ class KvStoreStreamMergeBuffer {
     return bytes_;
   }
   /*
-   * Bytes charged to the total budget: bytes() plus
-   * Constants::kKvStoreStreamMergedEntryOverheadBytes per entry. Example:
-   * 240 + 256 = 496 for the entry above.
+   * Bytes charged to the total budget. Example: 240 + 256 = 496 for the
+   * entry above when the buffer owns its value; 40 + 256 = 296 when the
+   * value stays in a pinned Publication.
    */
   size_t budgetBytes() const;
+  /*
+   * Bytes that destroying the buffer would free: budgetBytes() plus the
+   * pinned Publications that nothing else references. Ranks queues for
+   * eviction only.
+   */
+  size_t evictableBytes() const;
+  // Publications that entries point into.
+  size_t
+  pins() const {
+    return pins_.size();
+  }
 
   /*
    * Serialized bytes of one entry: its key plus its Compact serialized Value,
@@ -112,10 +154,21 @@ class KvStoreStreamMergeBuffer {
 
  private:
   struct Entry {
-    // std::nullopt for an expired key.
-    std::optional<thrift::Value> value;
-    // entryBytes(): serialized, without the overhead.
+    // A value the buffer owns.
+    std::optional<thrift::Value> owned;
+    // A value in a pinned Publication (pins_ key `pin`).
+    const thrift::Value* FOLLY_NULLABLE shared{nullptr};
+    const thrift::Publication* FOLLY_NULLABLE pin{nullptr};
+    // TTL and TTL version of a TTL refresh folded onto `shared`.
+    std::optional<std::pair<int64_t, int64_t>> ttl;
+    // entryBytes() of the value a client receives, without the overhead.
     size_t bytes{0};
+
+    bool
+    isExpiry() const {
+      return !owned && !shared;
+    }
+    bool hasData() const;
   };
   struct Segment {
     // Consecutive: segments_[i].seq == segments_.front().seq + i.
@@ -123,29 +176,49 @@ class KvStoreStreamMergeBuffer {
     std::string area;
     folly::F14FastMap<std::string, Entry> entries;
   };
+  struct Pin {
+    std::shared_ptr<thrift::Publication> publication;
+    // KvStoreStreamMessage::bytes of the Publication.
+    size_t bytes{0};
+    // Entries that point into the Publication.
+    size_t entries{0};
+  };
 
   // The open segment of `area`, or nullptr.
   Segment* FOLLY_NULLABLE openSegment(const std::string& area);
   /*
-   * Folds `value` (std::nullopt: expiry) into the entry of `key`; returns the
-   * change of its serialized bytes.
+   * Folds the value of `key` (nullptr: expiry) into its entry. `message` is
+   * the shared message that holds `value`, or nullptr when `owned` carries
+   * the value of an unshared message.
    */
-  int64_t fold(
+  void fold(
       Segment& segment,
       const std::string& key,
-      const std::optional<thrift::Value>& value);
+      thrift::Value* FOLLY_NULLABLE value,
+      const KvStoreStreamMessage* FOLLY_NULLABLE message);
+  // Clears the value of `entry` and drops its pin.
+  void clearValue(Entry& entry);
+  const thrift::Publication* pin(const KvStoreStreamMessage& message);
+  void unpin(const thrift::Publication* publication);
+  // Serialized bytes of the value a client receives for `entry`.
+  static size_t entryBytes(const std::string& key, const Entry& entry);
+  // Bytes `entry` charges to the budget, without the overhead.
+  static size_t chargedBytes(const std::string& key, const Entry& entry);
   /*
-   * Applies the change of the serialized bytes and of the entry count, and
-   * charges or releases the matching budget bytes.
+   * Applies the change of the serialized bytes, the charged bytes and the
+   * entry count, and charges or releases the matching budget bytes.
    */
-  void charge(int64_t bytesDelta, int64_t entriesDelta);
+  void charge(int64_t bytesDelta, int64_t chargedDelta, int64_t entriesDelta);
 
   const std::shared_ptr<std::atomic<size_t>> budget_;
   std::deque<Segment> segments_;
   // area -> seq of its open segment.
   folly::F14FastMap<std::string, uint64_t> openSegments_;
+  folly::F14FastMap<const thrift::Publication*, Pin> pins_;
+  std::vector<std::shared_ptr<thrift::Publication>> released_;
   uint64_t nextSeq_{0};
   size_t bytes_{0};
+  size_t chargedBytes_{0};
   size_t entries_{0};
 };
 

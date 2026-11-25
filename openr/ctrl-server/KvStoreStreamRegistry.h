@@ -31,20 +31,6 @@
 namespace openr {
 
 /*
- * One queued KvStore stream message. The queues of subscribers with the same
- * key filter reference one Publication; `shared` is then true and nothing
- * modifies it once queued. A message that one queue alone references
- * (`shared` false) is moved out by that queue's pop(). `bytes` is its
- * Compact serialized size. Example: about 1100 for a Publication with one
- * 1 KB value.
- */
-struct KvStoreStreamMessage {
-  std::shared_ptr<thrift::Publication> publication;
-  size_t bytes{0};
-  bool shared{false};
-};
-
-/*
  * Admission, memory, merge and slow-client limits. Example:
  * {.maxSnapshotsInFlight = 4, .maxSubscribers = 16, .maxQueueBytes = 32 MiB,
  * .maxTotalBytes = 256 MiB, .mergeBytes = 8 MiB, .mergeExitBytes = 4 MiB,
@@ -71,9 +57,10 @@ struct KvStoreStreamLimits {
 class KvStoreStreamQueue {
  public:
   /*
-   * `referencedBytes` is the total stream budget of the registry. Merged
-   * entries belong to this queue and charge it directly: their serialized
-   * bytes plus Constants::kKvStoreStreamMergedEntryOverheadBytes each.
+   * `referencedBytes` is the total stream budget of the registry. The merge
+   * buffer of this queue charges it directly
+   * (KvStoreStreamMergeBuffer::budgetBytes()); a value it points into a
+   * shared message stays charged once, by that message.
    */
   explicit KvStoreStreamQueue(
       std::shared_ptr<std::atomic<size_t>> referencedBytes);
@@ -137,8 +124,9 @@ class KvStoreStreamQueue {
   bool isMerging() const;
   /*
    * Total-budget bytes that closing the queue would free: its merged entries
-   * with their per-entry overhead (KvStoreStreamMergeBuffer::budgetBytes())
-   * and its messages that no other queue references. 0 when the queue holds
+   * with their per-entry overhead and the pinned Publications that nothing
+   * else references (KvStoreStreamMergeBuffer::evictableBytes()), and its
+   * messages that no other queue references. 0 when the queue holds
    * at most one message or segment and is not in merge mode: its client is
    * not behind. Example: 0 for a queue whose messages all-keys subscribers
    * share.

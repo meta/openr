@@ -1730,14 +1730,16 @@ TEST(KvStoreStreamRegistryTest, DestructorReleasesMergedBytes) {
 
 /*
  * Two all-keys subscribers share messages; only the one that is behind
- * merges. The budget counts the shared message once and the two merged
- * entries once with their overhead, and returns to 0 when both drain.
+ * merges, and its merged entries point into the shared messages. The budget
+ * counts each message once, plus the keys of the two merged entries with
+ * their overhead, and returns to 0 when both drain.
  */
 CO_TEST(KvStoreStreamRegistryTest, SharedMessageWithOneMergingSubscriber) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
   auto behind = add(*registry, 1, allKeysFilter());
   auto caughtUp = add(*registry, 2, allKeysFilter());
   registry->fanOut(makeUpdate({{"key1", "v1"}}), mergeLimits());
+  const auto key1Bytes = caughtUp.queue().queuedBytes();
   co_await caughtUp.queue().pop();
 
   registry->fanOut(makeUpdate({{"key2", "v1"}}), mergeLimits());
@@ -1745,11 +1747,47 @@ CO_TEST(KvStoreStreamRegistryTest, SharedMessageWithOneMergingSubscriber) {
   CO_ASSERT_TRUE(behind.queue().isMerging());
   CO_ASSERT_FALSE(caughtUp.queue().isMerging());
   EXPECT_EQ(
-      behind.queue().queuedBytes() + 2 * kOverhead +
-          caughtUp.queue().queuedBytes(),
+      key1Bytes + caughtUp.queue().queuedBytes() + /*keys=*/8 + 2 * kOverhead,
       registry->referencedBytes());
   co_await behind.queue().pop();
   co_await caughtUp.queue().pop();
+  EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * Subscribers with the same key filter that all merge keep one copy of each
+ * value: the budget counts each message that merged entries point into
+ * once, plus the keys and overhead of each queue's entries. The message
+ * whose value a later update replaced in every queue is freed. Each queue
+ * pops the latest values, and the budget returns to 0.
+ */
+CO_TEST(KvStoreStreamRegistryTest, MergeSharesValuesAcrossGroup) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  std::vector<KvStoreStreamHandle> handles;
+  for (int64_t id = 1; id <= 4; ++id) {
+    handles.push_back(add(*registry, id, allKeysFilter()));
+  }
+  registry->fanOut(
+      makeUpdate({{"key1", std::string(1000, 'a')}}), mergeLimits());
+  // One message that the four queues share.
+  const auto messageBytes = registry->referencedBytes();
+
+  registry->fanOut(
+      makeUpdate({{"key2", std::string(1000, 'b')}}), mergeLimits());
+  registry->fanOut(
+      makeUpdate({{"key1", std::string(1000, 'c')}}), mergeLimits());
+
+  for (auto& handle : handles) {
+    CO_ASSERT_TRUE(handle.queue().isMerging());
+  }
+  EXPECT_EQ(
+      2 * messageBytes + 4 * (/*keys=*/8 + 2 * kOverhead),
+      registry->referencedBytes());
+  for (auto& handle : handles) {
+    const auto pub = co_await handle.queue().pop();
+    EXPECT_EQ(std::string(1000, 'c'), *pub.keyVals()->at("key1").value());
+    EXPECT_EQ(std::string(1000, 'b'), *pub.keyVals()->at("key2").value());
+  }
   EXPECT_EQ(0, registry->referencedBytes());
 }
 

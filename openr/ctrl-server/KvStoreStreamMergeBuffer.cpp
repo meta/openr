@@ -29,7 +29,25 @@ serializedSize(const thrift::Value& value) {
   return value.serializedSizeZC(&writer);
 }
 
+// Bytes of an i64 field value, as serializedSize() counts them.
+size_t
+i64Bytes(int64_t value) {
+  apache::thrift::CompactProtocolWriter writer;
+  return writer.serializedSizeI64(value);
+}
+
+bool
+isTtlRefresh(const thrift::Value& value) {
+  return !value.value().has_value();
+}
+
 } // namespace
+
+bool
+KvStoreStreamMergeBuffer::Entry::hasData() const {
+  return owned ? owned->value().has_value()
+               : shared && shared->value().has_value();
+}
 
 KvStoreStreamMergeBuffer::KvStoreStreamMergeBuffer(
     std::shared_ptr<std::atomic<size_t>> budget)
@@ -45,12 +63,17 @@ KvStoreStreamMergeBuffer::KvStoreStreamMergeBuffer(
     : budget_(other.budget_),
       segments_(std::move(other.segments_)),
       openSegments_(std::move(other.openSegments_)),
+      pins_(std::move(other.pins_)),
+      released_(std::move(other.released_)),
       nextSeq_(other.nextSeq_),
       bytes_(std::exchange(other.bytes_, 0)),
+      chargedBytes_(std::exchange(other.chargedBytes_, 0)),
       entries_(std::exchange(other.entries_, 0)) {
   // Moved-from containers are valid but unspecified.
   other.segments_.clear();
   other.openSegments_.clear();
+  other.pins_.clear();
+  other.released_.clear();
 }
 
 KvStoreStreamMergeBuffer::~KvStoreStreamMergeBuffer() {
@@ -59,13 +82,56 @@ KvStoreStreamMergeBuffer::~KvStoreStreamMergeBuffer() {
 
 size_t
 KvStoreStreamMergeBuffer::budgetBytes() const {
-  return bytes_ + entries_ * Constants::kKvStoreStreamMergedEntryOverheadBytes;
+  return chargedBytes_ +
+      entries_ * Constants::kKvStoreStreamMergedEntryOverheadBytes;
+}
+
+size_t
+KvStoreStreamMergeBuffer::evictableBytes() const {
+  size_t bytes{budgetBytes()};
+  for (const auto& [_, pin] : pins_) {
+    /*
+     * use_count() only ranks queues here; nothing reads or moves the
+     * Publication based on it.
+     */
+    if (pin.publication.use_count() == 1) {
+      bytes += pin.bytes;
+    }
+  }
+  return bytes;
+}
+
+std::vector<std::shared_ptr<thrift::Publication>>
+KvStoreStreamMergeBuffer::takeReleased() {
+  return std::exchange(released_, {});
 }
 
 size_t
 KvStoreStreamMergeBuffer::entryBytes(
     const std::string& key, const std::optional<thrift::Value>& value) {
   return key.size() + (value ? serializedSize(*value) : kExpiredKeyBytes);
+}
+
+size_t
+KvStoreStreamMergeBuffer::entryBytes(
+    const std::string& key, const Entry& entry) {
+  if (!entry.shared) {
+    return entryBytes(key, entry.owned);
+  }
+  auto bytes = key.size() + serializedSize(*entry.shared);
+  if (entry.ttl) {
+    // Only the two TTL fields differ from the shared value.
+    bytes += i64Bytes(entry.ttl->first) + i64Bytes(entry.ttl->second);
+    bytes -=
+        i64Bytes(*entry.shared->ttl()) + i64Bytes(*entry.shared->ttlVersion());
+  }
+  return bytes;
+}
+
+size_t
+KvStoreStreamMergeBuffer::chargedBytes(
+    const std::string& key, const Entry& entry) {
+  return entry.shared ? key.size() : entry.bytes;
 }
 
 KvStoreStreamMergeBuffer::Segment* FOLLY_NULLABLE
@@ -78,7 +144,8 @@ KvStoreStreamMergeBuffer::openSegment(const std::string& area) {
 }
 
 bool
-KvStoreStreamMergeBuffer::add(const thrift::Publication& pub) {
+KvStoreStreamMergeBuffer::add(const KvStoreStreamMessage& message) {
+  auto& pub = *message.publication;
   if (pub.keyVals()->empty() && pub.expiredKeys()->empty()) {
     return false;
   }
@@ -90,7 +157,8 @@ KvStoreStreamMergeBuffer::add(const thrift::Publication& pub) {
                   pub.keyVals()->end(),
                   [segment](const auto& keyValue) {
                     auto it = segment->entries.find(keyValue.first);
-                    return it != segment->entries.end() && !it->second.value;
+                    return it != segment->entries.end() &&
+                        it->second.isExpiry();
                   });
   const bool started = !segment || meetsExpiry;
   if (started) {
@@ -101,36 +169,82 @@ KvStoreStreamMergeBuffer::add(const thrift::Publication& pub) {
   }
   XCHECK(segment != nullptr);
   auto& target = *segment;
-  const auto entriesBefore = target.entries.size();
-  int64_t bytesDelta{0};
-  for (const auto& [key, value] : *pub.keyVals()) {
-    bytesDelta += fold(target, key, value);
+  const auto* shared = message.shared ? &message : nullptr;
+  for (auto& [key, value] : *pub.keyVals()) {
+    fold(target, key, &value, shared);
   }
   for (const auto& key : *pub.expiredKeys()) {
-    bytesDelta += fold(target, key, std::nullopt);
+    fold(target, key, nullptr, nullptr);
   }
-  charge(
-      bytesDelta, static_cast<int64_t>(target.entries.size() - entriesBefore));
   return started;
 }
 
-int64_t
+void
 KvStoreStreamMergeBuffer::fold(
     Segment& segment,
     const std::string& key,
-    const std::optional<thrift::Value>& value) {
-  auto& entry = segment.entries[key];
+    thrift::Value* FOLLY_NULLABLE value,
+    const KvStoreStreamMessage* FOLLY_NULLABLE message) {
+  auto [it, inserted] = segment.entries.try_emplace(key);
+  auto& entry = it->second;
   const auto oldBytes = static_cast<int64_t>(entry.bytes);
-  if (value && !value->value().has_value() && entry.value &&
-      entry.value->value().has_value()) {
+  const auto oldCharged =
+      inserted ? 0 : static_cast<int64_t>(chargedBytes(key, entry));
+  if (value && isTtlRefresh(*value) && entry.hasData()) {
     // A TTL refresh keeps the merged value and takes the new TTL.
-    entry.value->ttl() = *value->ttl();
-    entry.value->ttlVersion() = *value->ttlVersion();
+    if (entry.owned) {
+      entry.owned->ttl() = *value->ttl();
+      entry.owned->ttlVersion() = *value->ttlVersion();
+    } else {
+      entry.ttl.emplace(*value->ttl(), *value->ttlVersion());
+    }
   } else {
-    entry.value = value;
+    clearValue(entry);
+    if (value && message) {
+      entry.shared = value;
+      entry.pin = pin(*message);
+    } else if (value) {
+      // The message is this queue's alone: nothing else reads it.
+      entry.owned = std::move(*value);
+    }
   }
-  entry.bytes = entryBytes(key, entry.value);
-  return static_cast<int64_t>(entry.bytes) - oldBytes;
+  entry.bytes = entryBytes(key, entry);
+  charge(
+      static_cast<int64_t>(entry.bytes) - oldBytes,
+      static_cast<int64_t>(chargedBytes(key, entry)) - oldCharged,
+      inserted ? 1 : 0);
+}
+
+void
+KvStoreStreamMergeBuffer::clearValue(Entry& entry) {
+  if (entry.pin) {
+    unpin(entry.pin);
+  }
+  entry.owned.reset();
+  entry.shared = nullptr;
+  entry.pin = nullptr;
+  entry.ttl.reset();
+}
+
+const thrift::Publication*
+KvStoreStreamMergeBuffer::pin(const KvStoreStreamMessage& message) {
+  auto& pin = pins_[message.publication.get()];
+  if (!pin.publication) {
+    pin.publication = message.publication;
+    pin.bytes = message.bytes;
+  }
+  ++pin.entries;
+  return message.publication.get();
+}
+
+void
+KvStoreStreamMergeBuffer::unpin(const thrift::Publication* publication) {
+  auto it = pins_.find(publication);
+  XCHECK(it != pins_.end());
+  if (--it->second.entries == 0) {
+    released_.push_back(std::move(it->second.publication));
+    pins_.erase(it);
+  }
 }
 
 thrift::Publication
@@ -143,41 +257,52 @@ KvStoreStreamMergeBuffer::pop(size_t maxBytes) {
   }
   thrift::Publication pub;
   pub.area() = segment.area;
-  // The cap applies to budget bytes: they leave the budget at this pop.
-  size_t poppedBudgetBytes{0};
-  size_t poppedBytes{0};
-  size_t poppedEntries{0};
+  size_t poppedCapBytes{0};
+  int64_t poppedBytes{0};
+  int64_t poppedCharged{0};
+  int64_t poppedEntries{0};
   while (!segment.entries.empty()) {
     auto it = segment.entries.begin();
-    const auto entryBudgetBytes =
+    const auto entryCapBytes =
         it->second.bytes + Constants::kKvStoreStreamMergedEntryOverheadBytes;
-    if (poppedEntries > 0 && poppedBudgetBytes + entryBudgetBytes > maxBytes) {
+    if (poppedEntries > 0 && poppedCapBytes + entryCapBytes > maxBytes) {
       break;
     }
-    poppedBudgetBytes += entryBudgetBytes;
-    poppedBytes += it->second.bytes;
+    poppedCapBytes += entryCapBytes;
+    poppedBytes += static_cast<int64_t>(it->second.bytes);
+    poppedCharged += static_cast<int64_t>(chargedBytes(it->first, it->second));
     ++poppedEntries;
-    segment.entries.eraseInto(it, [&pub](std::string&& key, Entry&& entry) {
-      if (entry.value) {
-        pub.keyVals()->emplace(std::move(key), std::move(*entry.value));
-      } else {
-        pub.expiredKeys()->push_back(std::move(key));
-      }
-    });
+    segment.entries.eraseInto(
+        it, [this, &pub](std::string&& key, Entry&& entry) {
+          if (entry.owned) {
+            pub.keyVals()->emplace(std::move(key), std::move(*entry.owned));
+          } else if (entry.shared) {
+            thrift::Value value = *entry.shared;
+            if (entry.ttl) {
+              value.ttl() = entry.ttl->first;
+              value.ttlVersion() = entry.ttl->second;
+            }
+            pub.keyVals()->emplace(std::move(key), std::move(value));
+            unpin(entry.pin);
+          } else {
+            pub.expiredKeys()->push_back(std::move(key));
+          }
+        });
   }
   if (segment.entries.empty()) {
     segments_.pop_front();
   }
-  charge(
-      -static_cast<int64_t>(poppedBytes), -static_cast<int64_t>(poppedEntries));
+  charge(-poppedBytes, -poppedCharged, -poppedEntries);
   return pub;
 }
 
 void
-KvStoreStreamMergeBuffer::charge(int64_t bytesDelta, int64_t entriesDelta) {
+KvStoreStreamMergeBuffer::charge(
+    int64_t bytesDelta, int64_t chargedDelta, int64_t entriesDelta) {
   bytes_ += bytesDelta;
+  chargedBytes_ += chargedDelta;
   entries_ += entriesDelta;
-  const auto budgetDelta = bytesDelta +
+  const auto budgetDelta = chargedDelta +
       entriesDelta *
           static_cast<int64_t>(
               Constants::kKvStoreStreamMergedEntryOverheadBytes);

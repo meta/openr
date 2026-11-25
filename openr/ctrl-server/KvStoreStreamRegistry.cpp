@@ -96,6 +96,7 @@ KvStoreStreamQueue::push(
   std::deque<KvStoreStreamMessage> dropped;
   std::optional<KvStoreStreamMergeBuffer> droppedMerged;
   std::deque<KvStoreStreamMessage> folded;
+  std::vector<std::shared_ptr<thrift::Publication>> released;
   {
     auto state = state_.wlock();
     if (state->closeReason) {
@@ -112,7 +113,7 @@ KvStoreStreamQueue::push(
     }
     bool overflow{false};
     if (state->merging) {
-      added = state->merged.add(*message.publication) || added;
+      added = state->merged.add(message) || added;
       overflow = !empty && state->bytes() > limits.maxQueueBytes;
     } else {
       overflow =
@@ -135,10 +136,12 @@ KvStoreStreamQueue::push(
       state->messages.push_back(std::move(message));
       added = true;
     }
+    released = state->merged.takeReleased();
   }
   /*
-   * The lock is released: `folded`, `dropped` and `droppedMerged` free their
-   * Publications at return, without blocking fanOut() or pop().
+   * The lock is released: `folded`, `dropped`, `droppedMerged` and
+   * `released` free their Publications at return, without blocking fanOut()
+   * or pop().
    */
   if (added) {
     available_.signal();
@@ -155,7 +158,7 @@ KvStoreStreamQueue::enterMergeMode(State& state, size_t mergeExitBytes) {
    * cover the segments; the rest are surplus.
    */
   for (const auto& message : state.messages) {
-    std::ignore = state.merged.add(*message.publication);
+    std::ignore = state.merged.add(message);
   }
   std::deque<KvStoreStreamMessage> folded;
   folded.swap(state.messages);
@@ -173,6 +176,8 @@ KvStoreStreamQueue::pop() {
     // A segment that keeps entries after its chunk keeps its token.
     bool segmentLeft{false};
     KvStoreStreamMessage message;
+    // Pinned Publications that the pop released: freed after the lock.
+    std::vector<std::shared_ptr<thrift::Publication>> released;
     {
       auto state = state_.wlock();
       if (state->closeReason) {
@@ -183,6 +188,7 @@ KvStoreStreamQueue::pop() {
         mergedPub =
             state->merged.pop(Constants::kKvStoreStreamMergedPopMaxBytes);
         segmentLeft = state->merged.segments() == segments;
+        released = state->merged.takeReleased();
         if (state->merging && state->bytes() < state->mergeExitBytes) {
           state->merging = false;
         }
@@ -265,14 +271,15 @@ KvStoreStreamQueue::evictableBytes() const {
   auto state = state_.rlock();
   /*
    * A queue in merge mode holds the updates of several publications: it is
-   * behind. Its merged entries belong to it alone; closing it frees their
-   * budget bytes, the per-entry overhead included.
+   * behind. Closing it frees the budget bytes of its merged entries, the
+   * per-entry overhead included, and the pinned Publications that no other
+   * queue references.
    */
   if (!state->merging &&
       state->messages.size() + state->merged.segments() <= 1) {
     return 0;
   }
-  size_t bytes{state->merged.budgetBytes()};
+  size_t bytes{state->merged.evictableBytes()};
   for (const auto& message : state->messages) {
     /*
      * use_count() only ranks queues here; nothing reads or moves the
