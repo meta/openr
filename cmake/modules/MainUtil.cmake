@@ -21,6 +21,7 @@ macro(openr_add_main_util_library)
     PUBLIC_DEPENDENCIES
       openr_common
       openr_util
+      openr_config
       openr_ctrl_handler
       openr_fib
       openr_kvstore_peer_ingress_limit

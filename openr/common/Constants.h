@@ -402,11 +402,26 @@ class Constants {
   static constexpr size_t kOpenrCtrlThriftEgressMemoryLimitBytes{
       128 * 1024 * 1024};
   /*
-   * Per connection: pending stream writes above which the connection's stream
-   * generators (KvStore/Fib subscriptions) are paused until it drains.
+   * Per connection: pending stream writes above which Thrift pauses the
+   * generator-based streams of the connection until it drains. Publisher-based
+   * streams (ServerPublisherStream) implement no pause and keep sending.
    */
   static constexpr size_t kOpenrCtrlThriftEgressBackpressureThresholdBytes{
       8 * 1024 * 1024};
+
+  /*
+   * KvStore stream send quota, applied with enable_ctrl_thrift_server_limits
+   * after the threshold above, which it overrides. Per connection: Thrift
+   * compares it to the allocated size of the writes queued in the
+   * connection's socket buffer (RPC responses and stream payloads; the kernel
+   * send buffer is not counted). Above it, Thrift pauses every
+   * generator-based stream of the connection, and resumes them below the
+   * recovery size: Thrift's default recovery factor 0.75 of the quota
+   * (1.5 MiB). RPC responses continue during a pause. A small quota keeps the
+   * backlog of a slow subscriber in the Open/R stream queue, where Open/R
+   * bounds it. See T294995552.
+   */
+  static constexpr size_t kKvStoreStreamSendQuotaBytes{2 * 1024 * 1024};
 
   /*
    *

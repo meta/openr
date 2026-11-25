@@ -162,6 +162,30 @@ configureCtrlThriftServerLimits(apache::thrift::ThriftServer& server) {
 }
 
 void
+configureKvStoreStreamLimits(apache::thrift::ThriftServer& server) {
+  static_assert(
+      Constants::kKvStoreStreamSendQuotaBytes <
+      Constants::kOpenrCtrlThriftEgressMemoryLimitBytes);
+  // The quota lowers, never raises, the threshold of the server limits.
+  static_assert(
+      Constants::kKvStoreStreamSendQuotaBytes <=
+      Constants::kOpenrCtrlThriftEgressBackpressureThresholdBytes);
+  server.setEgressBufferBackpressureThreshold(
+      Constants::kKvStoreStreamSendQuotaBytes);
+}
+
+void
+configureCtrlThriftServer(
+    const Config& config, apache::thrift::ThriftServer& server) {
+  if (!config.isCtrlThriftServerLimitsEnabled()) {
+    return;
+  }
+  configureCtrlThriftServerLimits(server);
+  // After the server limits: the send quota overrides their threshold.
+  configureKvStoreStreamLimits(server);
+}
+
+void
 waitTillStart(std::shared_ptr<apache::thrift::ThriftServer> server) {
   while (true) {
     auto evb = server->getServeEventBase();

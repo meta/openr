@@ -847,6 +847,8 @@ if(BUILD_TESTS)
       openr/common/tests/MainUtilTest.cpp
     LIBRARIES
       openr_main_util
+      openr_config
+      openr_test_utils
       Folly::folly
       FBThrift::thriftcpp2
       glog::glog

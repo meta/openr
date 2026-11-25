@@ -12,6 +12,7 @@
 
 #include <openr/common/OpenrEventBase.h>
 #include <openr/common/Util.h>
+#include <openr/config/Config.h>
 #include <openr/ctrl-server/OpenrCtrlHandler.h>
 #include <openr/fib/Fib.h>
 #include <openr/kvstore/KvStorePeerIngressLimit.h>
@@ -102,6 +103,24 @@ void configureKvStorePeerThriftServerMemoryLimits(
  * Do not apply to the KvStore peer server.
  */
 void configureCtrlThriftServerLimits(apache::thrift::ThriftServer& server);
+
+/**
+ * Apply the KvStore stream send quota to the OpenrCtrl server on port 2018.
+ * Call before serve() and after configureCtrlThriftServerLimits(), whose
+ * backpressure threshold the quota overrides. Do not apply to the KvStore peer
+ * server. Main uses configureCtrlThriftServer(), which keeps that order.
+ */
+void configureKvStoreStreamLimits(apache::thrift::ThriftServer& server);
+
+/**
+ * With enable_ctrl_thrift_server_limits set in `config`, apply
+ * configureCtrlThriftServerLimits() and then configureKvStoreStreamLimits(),
+ * so the 2 MiB send quota overrides the 8 MiB backpressure threshold. Without
+ * the knob, the server keeps the Thrift defaults. Call before serve() on every
+ * OpenrCtrl server (port 2018). Do not apply to the KvStore peer server.
+ */
+void configureCtrlThriftServer(
+    const Config& config, apache::thrift::ThriftServer& server);
 
 void waitTillStart(std::shared_ptr<apache::thrift::ThriftServer> server);
 
