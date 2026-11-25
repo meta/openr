@@ -151,6 +151,39 @@ TEST(KvStorePublicationFilter, KeepsAllKeys) {
   }
 }
 
+// describe() names every field that decides sharing, and caps the keys.
+TEST(KvStorePublicationFilter, Describe) {
+  EXPECT_EQ(
+      "areas [] keys [] originators [] oper OR ignoreTtl true "
+      "doNotPublishValue false",
+      KvStorePublicationFilter({} /* selectAreas */, thrift::KeyDumpParams{})
+          .describe());
+
+  thrift::KeyDumpParams params;
+  params.keys() = std::vector<std::string>{"adj:", "prefix:"};
+  params.originatorIds() = std::set<std::string>{"node1", "node2"};
+  params.oper() = thrift::FilterOperator::AND;
+  params.ignoreTtl() = false;
+  params.doNotPublishValue() = true;
+  EXPECT_EQ(
+      "areas [pod, spine] keys [adj:, prefix:] originators [node1, node2] "
+      "oper AND ignoreTtl false doNotPublishValue true",
+      KvStorePublicationFilter({"spine", "pod"}, params).describe());
+
+  // The first 10 keys, then the count of the others.
+  std::vector<std::string> keys;
+  keys.reserve(12);
+  for (int i = 0; i < 12; ++i) {
+    keys.push_back("k" + std::to_string(i));
+  }
+  params.keys() = keys;
+  EXPECT_EQ(
+      "areas [spine] keys [k0, k1, k2, k3, k4, k5, k6, k7, k8, k9 (+2 more)] "
+      "originators [node1, node2] oper AND ignoreTtl false "
+      "doNotPublishValue true",
+      KvStorePublicationFilter({"spine"}, params).describe());
+}
+
 TEST(KvStorePublicationFilter, MatchesArea) {
   const KvStorePublicationFilter allAreas(
       {} /* selectAreas */, thrift::KeyDumpParams{});

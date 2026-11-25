@@ -10,6 +10,7 @@
 
 #include <fb303/ServiceData.h>
 #include <folly/ScopeGuard.h>
+#include <folly/SocketAddress.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/CurrentExecutor.h>
 #include <folly/coro/FutureUtil.h>
@@ -19,6 +20,7 @@
 #include <folly/synchronization/Baton.h>
 #include <thrift/lib/cpp2/TrustedServerException.h>
 #include <thrift/lib/cpp2/async/RpcOptions.h>
+#include <thrift/lib/cpp2/server/Cpp2ConnContext.h>
 #include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include <openr/common/Constants.h>
@@ -2856,7 +2858,9 @@ class OpenrCtrlStreamLimitsFixture : public OpenrCtrlFixture {
         .maxSnapshotsInFlight = maxSnapshotsInFlight,
         .maxSubscribers = maxSubscribers,
         .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
-        .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes};
+        .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes,
+        .slowClientBytes = Constants::kKvStoreStreamSlowClientBytes,
+        .slowClientDuration = Constants::kKvStoreStreamSlowClientDuration};
   }
 };
 
@@ -3138,6 +3142,101 @@ CO_TEST_F(
           "subscribers.kvstore.subscribe_rejects.queue_closed.count"));
   EXPECT_EQ(0, handler_->getNumKvStoreStreams());
   EXPECT_EQ(0, handler_->getNumKvStoreSnapshotsInFlight());
+}
+
+// With the knob on, the stats timer runs until stop().
+TEST_F(OpenrCtrlStreamLimitsFixture, StreamStatsTimerRunsUntilStop) {
+  EXPECT_TRUE(handler_->isKvStoreStreamStatsTimerScheduledForTest());
+  // The callback schedules the next check.
+  handler_->runKvStoreStreamStatsTimeoutForTest();
+  EXPECT_TRUE(handler_->isKvStoreStreamStatsTimerScheduledForTest());
+
+  handler_->stop();
+  EXPECT_FALSE(handler_->isKvStoreStreamStatsTimerScheduledForTest());
+  // A callback already running at stop() does not reschedule.
+  handler_->runKvStoreStreamStatsTimeoutForTest();
+  EXPECT_FALSE(handler_->isKvStoreStreamStatsTimerScheduledForTest());
+}
+
+// With the knob off, there is no stats timer.
+TEST_F(OpenrCtrlFixture, NoStreamStatsTimerWithKnobOff) {
+  EXPECT_FALSE(handler_->isKvStoreStreamStatsTimerScheduledForTest());
+}
+
+/*
+ * The stats timer callback reports a slow client through fb303, and the slow
+ * gauge drops as soon as the stream ends. The client grants one credit and
+ * reads nothing: Thrift pulls one update and the others stay queued. With a
+ * threshold of 1 byte and no duration, the first check that saw the pull
+ * and a queued update marks the stream slow.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, StreamStatsTimerReportsSlowClient) {
+  auto limits = admissionLimits(4, 16);
+  // A few updates fill a few percent of it.
+  limits.maxQueueBytes = 1024;
+  limits.slowClientBytes = 1;
+  limits.slowClientDuration = std::chrono::seconds(0);
+  handler_->setKvStoreStreamLimitsForTest(limits);
+  const auto counter = [](const std::string& key) {
+    return facebook::fb303::fbData->getCounterIfExists(key).value_or(0);
+  };
+  const auto eventsBefore =
+      counter("subscribers.kvstore.slow_client_events.count");
+  {
+    apache::thrift::RpcOptions options;
+    options.setChunkBufferSize(1);
+    auto responseAndStream =
+        co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+            options, thrift::KeyDumpParams{}, kSpineOnlySet);
+    for (const auto& key : {"key1", "key2", "key3"}) {
+      kvStoreWrapper_->setKey(
+          kSpineAreaId,
+          key,
+          createThriftValue(1, "node1", std::string("value")),
+          std::nullopt);
+    }
+    // The fan-out and the pull run on other threads.
+    while (counter("subscribers.kvstore.slow_clients") != 1) {
+      handler_->runKvStoreStreamStatsTimeoutForTest();
+      std::this_thread::yield();
+    }
+    EXPECT_EQ(
+        eventsBefore + 1,
+        counter("subscribers.kvstore.slow_client_events.count"));
+    EXPECT_LT(0, counter("subscribers.kvstore.queue_occupancy_pct_max"));
+    EXPECT_LT(0, counter("subscribers.kvstore.queued_bytes"));
+  }
+
+  // Dropping the client stream cancels it; no further check runs.
+  while (handler_->getNumKvStoreStreams() != 0) {
+    std::this_thread::yield();
+  }
+  EXPECT_EQ(0, counter("subscribers.kvstore.slow_clients"));
+}
+
+/*
+ * The client description names the peer address and the peer CN, or
+ * "unknown client" without a connection.
+ */
+TEST(OpenrCtrlHandlerTest, DescribeRequestClient) {
+  EXPECT_EQ("unknown client", OpenrCtrlHandler::describeRequestClient(nullptr));
+  apache::thrift::Cpp2RequestContext noConnection(nullptr);
+  EXPECT_EQ(
+      "unknown client", OpenrCtrlHandler::describeRequestClient(&noConnection));
+
+  const folly::SocketAddress address("::1", 41234);
+  apache::thrift::Cpp2ConnContext connContext(&address);
+  apache::thrift::Cpp2RequestContext requestContext(&connContext);
+  EXPECT_EQ(
+      "[::1]:41234 (no peer CN)",
+      OpenrCtrlHandler::describeRequestClient(&requestContext));
+
+  // Without a peer address, the connection holds an uninitialized one.
+  apache::thrift::Cpp2ConnContext noAddress;
+  apache::thrift::Cpp2RequestContext noAddressRequest(&noAddress);
+  EXPECT_EQ(
+      "unknown address (no peer CN)",
+      OpenrCtrlHandler::describeRequestClient(&noAddressRequest));
 }
 
 // Handler shutdown ends each queue stream with "publisher terminated".

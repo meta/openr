@@ -7,7 +7,12 @@
 
 #include <openr/kvstore/KvStorePublicationFilter.h>
 
+#include <algorithm>
+
+#include <fmt/format.h>
+#include <folly/String.h>
 #include <folly/logging/xlog.h>
+#include <thrift/lib/cpp/util/EnumUtils.h>
 
 #include <openr/common/Util.h>
 
@@ -92,6 +97,27 @@ KvStorePublicationFilter::apply(const thrift::Publication& pub) const {
     return std::nullopt;
   }
   return publication_filtered;
+}
+
+std::string
+KvStorePublicationFilter::describe() const {
+  constexpr size_t kMaxKeys{10};
+  const auto& keys = *filter_.keys();
+  const auto numKeys = std::min(keys.size(), kMaxKeys);
+  auto keysText = folly::join(", ", keys.begin(), keys.begin() + numKeys);
+  if (keys.size() > numKeys) {
+    keysText += fmt::format(" (+{} more)", keys.size() - numKeys);
+  }
+  return fmt::format(
+      "areas [{}] keys [{}] originators [{}] oper {} ignoreTtl {} "
+      "doNotPublishValue {}",
+      folly::join(", ", selectAreas_),
+      keysText,
+      folly::join(", ", *filter_.originatorIds()),
+      apache::thrift::util::enumNameSafe(
+          filter_.oper().value_or(thrift::FilterOperator::OR)),
+      *filter_.ignoreTtl(),
+      *filter_.doNotPublishValue());
 }
 
 thrift::KeyVals

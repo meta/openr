@@ -110,12 +110,16 @@ class KvStoreStreamQueue {
 };
 
 struct KvStoreStreamSubscriber {
-  KvStoreStreamSubscriber(int64_t id, KvStorePublicationFilter filter);
+  KvStoreStreamSubscriber(
+      int64_t id, KvStorePublicationFilter filter, std::string client);
 
   const int64_t id;
   const KvStorePublicationFilter filter;
+  // Peer address and peer CN. Example: "[2401:db00::1]:41234 (pss.example)"
+  const std::string client;
   const std::chrono::steady_clock::time_point subscriptionTime;
   KvStoreStreamQueue queue;
+
   /*
    * Guarded by the registry lock. Set from admission until Thrift starts the
    * stream (the generator's first pull), or until tryAdd() reclaims the slot.
@@ -123,17 +127,31 @@ struct KvStoreStreamSubscriber {
   bool holdsSnapshotSlot{true};
   // Guarded by the registry lock. When tryAdd() admitted the subscriber.
   std::chrono::steady_clock::time_point admissionTime;
+  /*
+   * Guarded by the registry lock. Slow-client state of evaluateSlowClients():
+   * since when every check saw the queue at or above the threshold; the
+   * messages sent at the previous check; the last check that saw a message
+   * sent since the one before.
+   */
+  std::optional<std::chrono::steady_clock::time_point> aboveSlowSince;
+  int64_t sentAtLastCheck{0};
+  std::optional<std::chrono::steady_clock::time_point> lastProgressTime;
+  bool slow{false};
 };
 
 /*
- * Admission and memory limits. Example: {.maxSnapshotsInFlight = 4,
- * .maxSubscribers = 16, .maxQueueBytes = 32 MiB, .maxTotalBytes = 256 MiB}.
+ * Admission, memory and slow-client limits. Example: {.maxSnapshotsInFlight =
+ * 4, .maxSubscribers = 16, .maxQueueBytes = 32 MiB, .maxTotalBytes = 256 MiB,
+ * .slowClientBytes = 16 MiB, .slowClientDuration = 300s}.
  */
 struct KvStoreStreamLimits {
   size_t maxSnapshotsInFlight{0};
   size_t maxSubscribers{0};
   size_t maxQueueBytes{0};
   size_t maxTotalBytes{0};
+  // 0 disables slow-client detection.
+  size_t slowClientBytes{0};
+  std::chrono::seconds slowClientDuration{0};
 };
 
 /*
@@ -214,6 +232,7 @@ class KvStoreStreamRegistry
       int64_t id,
       KvStorePublicationFilter filter,
       const KvStoreStreamLimits& limits,
+      std::string client = "unknown client",
       std::chrono::steady_clock::time_point now =
           std::chrono::steady_clock::now());
 
@@ -231,6 +250,22 @@ class KvStoreStreamRegistry
    */
   void fanOut(
       const thrift::Publication& pub, const KvStoreStreamLimits& limits);
+
+  /*
+   * One slow-client check at `now`. A stream enters the slow state when every
+   * check for at least limits.slowClientDuration saw its queue at or above
+   * limits.slowClientBytes, and its client pulled a message within
+   * Constants::kKvStoreStreamSlowClientProgressWindow (seen by comparing
+   * consecutive checks). It leaves the state when its queue falls below half
+   * of limits.slowClientBytes. Closed queues are skipped, and
+   * limits.slowClientBytes == 0 disables detection. Also refreshes the gauges
+   * subscribers.kvstore.slow_clients, .queue_occupancy_pct_max and
+   * .queued_bytes. The handler calls it every
+   * Constants::kKvStoreStreamStatsInterval on the ctrl event base.
+   */
+  void evaluateSlowClients(
+      const KvStoreStreamLimits& limits,
+      std::chrono::steady_clock::time_point now);
 
   /*
    * Closes every queue; each stream ends with `reason`. Later tryAdd() calls
@@ -265,6 +300,19 @@ class KvStoreStreamRegistry
   }
 
   /*
+   * Streams in the slow state, and entries into it. Removing a slow stream
+   * updates slowClients() at once.
+   */
+  size_t
+  slowClients() const {
+    return slowClients_.load();
+  }
+  int64_t
+  slowClientEvents() const {
+    return slowClientEvents_.load();
+  }
+
+  /*
    * One entry per subscriber. total_streamed_msgs counts the messages that
    * pop() handed to the stream (the publisher path counts every publication
    * offered, filtered out or not). last_msg_sent_time is when pop() last
@@ -275,8 +323,13 @@ class KvStoreStreamRegistry
  private:
   friend class KvStoreStreamHandle;
   struct State;
-  // Removes the subscriber and its snapshot slot; false when it is gone.
-  static bool erase(State& state, int64_t id);
+  /*
+   * Removes the subscriber, its snapshot slot and its slow state; false when
+   * it is gone.
+   */
+  bool erase(State& state, int64_t id);
+  // Sets the slow streams count and its gauge. Under the registry lock.
+  void setSlowClients(State& state, size_t slowClients);
   void remove(int64_t id);
   // Removes the subscribers whose queues fanOut() closed.
   void removeClosed(const std::vector<int64_t>& ids);
@@ -292,6 +345,8 @@ class KvStoreStreamRegistry
     folly::F14FastMap<int64_t, std::shared_ptr<KvStoreStreamSubscriber>>
         subscribers;
     size_t snapshotsInFlight{0};
+    // Subscribers in the slow state.
+    size_t slowClients{0};
     // Set by closeAll().
     folly::exception_wrapper closeReason;
   };
@@ -307,6 +362,8 @@ class KvStoreStreamRegistry
       std::make_shared<std::atomic<size_t>>(0)};
   std::atomic<int64_t> overflowDrops_{0};
   std::atomic<int64_t> budgetDrops_{0};
+  std::atomic<size_t> slowClients_{0};
+  std::atomic<int64_t> slowClientEvents_{0};
 };
 
 } // namespace openr

@@ -35,6 +35,12 @@ constexpr std::string_view kQueuedBytesCounter{
 constexpr std::string_view kOverflowDropsStat{
     "subscribers.kvstore.overflow_drops"};
 constexpr std::string_view kBudgetDropsStat{"subscribers.kvstore.budget_drops"};
+constexpr std::string_view kSlowClientsCounter{
+    "subscribers.kvstore.slow_clients"};
+constexpr std::string_view kSlowClientEventsStat{
+    "subscribers.kvstore.slow_client_events"};
+constexpr std::string_view kMaxOccupancyCounter{
+    "subscribers.kvstore.queue_occupancy_pct_max"};
 
 size_t
 serializedSize(const thrift::Publication& pub) {
@@ -205,9 +211,10 @@ KvStoreStreamQueue::frontPublicationForTest() const {
 }
 
 KvStoreStreamSubscriber::KvStoreStreamSubscriber(
-    int64_t id, KvStorePublicationFilter filter)
+    int64_t id, KvStorePublicationFilter filter, std::string client)
     : id(id),
       filter(std::move(filter)),
+      client(std::move(client)),
       subscriptionTime(std::chrono::steady_clock::now()) {}
 
 KvStoreStreamHandle::KvStoreStreamHandle(
@@ -239,9 +246,10 @@ KvStoreStreamRegistry::tryAdd(
     int64_t id,
     KvStorePublicationFilter filter,
     const KvStoreStreamLimits& limits,
+    std::string client,
     std::chrono::steady_clock::time_point now) {
-  auto subscriber =
-      std::make_shared<KvStoreStreamSubscriber>(id, std::move(filter));
+  auto subscriber = std::make_shared<KvStoreStreamSubscriber>(
+      id, std::move(filter), std::move(client));
   enum class Admission { ADMITTED, CLOSED, REJECTED };
   KvStoreStreamRejection rejection;
   std::vector<int64_t> reclaimed;
@@ -327,10 +335,25 @@ KvStoreStreamRegistry::erase(State& state, int64_t id) {
   if (it->second->holdsSnapshotSlot) {
     --state.snapshotsInFlight;
   }
+  /*
+   * The gauge drops at once, not at the next check. `slowClients` counts the
+   * subscribers whose `slow` flag is set; both change under this lock only.
+   */
+  if (it->second->slow) {
+    XDCHECK_GT(state.slowClients, 0);
+    setSlowClients(state, state.slowClients > 0 ? state.slowClients - 1 : 0);
+  }
   state.subscribers.erase(it);
   facebook::fb303::fbData->setCounter(
       kSubscribersCounter, state.subscribers.size());
   return true;
+}
+
+void
+KvStoreStreamRegistry::setSlowClients(State& state, size_t slowClients) {
+  state.slowClients = slowClients;
+  slowClients_ = slowClients;
+  facebook::fb303::fbData->setCounter(kSlowClientsCounter, slowClients);
 }
 
 void
@@ -452,6 +475,97 @@ KvStoreStreamRegistry::fanOut(
   removeClosed(overflowed);
   enforceTotalBudget(limits.maxTotalBytes);
   facebook::fb303::fbData->setCounter(kQueuedBytesCounter, referencedBytes());
+}
+
+void
+KvStoreStreamRegistry::evaluateSlowClients(
+    const KvStoreStreamLimits& limits,
+    std::chrono::steady_clock::time_point now) {
+  size_t maxOccupancyPct{0};
+  std::vector<std::shared_ptr<KvStoreStreamSubscriber>> entered;
+  std::vector<std::shared_ptr<KvStoreStreamSubscriber>> left;
+  state_.withWLock([&](auto& state) {
+    size_t numSlow{0};
+    for (auto& [_, subscriber] : state.subscribers) {
+      const auto sent = subscriber->queue.sentMessages();
+      if (sent > subscriber->sentAtLastCheck) {
+        subscriber->lastProgressTime = now;
+      }
+      subscriber->sentAtLastCheck = sent;
+      const auto bytes = subscriber->queue.queuedBytes();
+      if (limits.maxQueueBytes > 0) {
+        maxOccupancyPct =
+            std::max(maxOccupancyPct, bytes * 100 / limits.maxQueueBytes);
+      }
+      /*
+       * A closed queue's stream is ending: it is no longer slow, and it did
+       * not recover. fanOut() removes the queues it closes at once; queues
+       * that closeAll() closes stay until their stream ends.
+       */
+      if (limits.slowClientBytes == 0 || subscriber->queue.isClosed()) {
+        subscriber->aboveSlowSince.reset();
+        subscriber->slow = false;
+        continue;
+      }
+      if (subscriber->slow) {
+        // Hysteresis: one check just below the threshold does not end it.
+        if (bytes * 2 < limits.slowClientBytes) {
+          subscriber->aboveSlowSince.reset();
+          subscriber->slow = false;
+          left.push_back(subscriber);
+        } else {
+          ++numSlow;
+        }
+        continue;
+      }
+      if (bytes < limits.slowClientBytes) {
+        subscriber->aboveSlowSince.reset();
+        continue;
+      }
+      if (!subscriber->aboveSlowSince) {
+        subscriber->aboveSlowSince = now;
+      }
+      // A client that stopped pulling is stalled, not slow.
+      const bool pulls = subscriber->lastProgressTime &&
+          now - *subscriber->lastProgressTime <=
+              Constants::kKvStoreStreamSlowClientProgressWindow;
+      if (pulls &&
+          now - *subscriber->aboveSlowSince >= limits.slowClientDuration) {
+        subscriber->slow = true;
+        ++numSlow;
+        entered.push_back(subscriber);
+      }
+    }
+    setSlowClients(state, numSlow);
+  });
+
+  facebook::fb303::fbData->setCounter(kMaxOccupancyCounter, maxOccupancyPct);
+  facebook::fb303::fbData->setCounter(kQueuedBytesCounter, referencedBytes());
+  for (const auto& subscriber : entered) {
+    ++slowClientEvents_;
+    facebook::fb303::fbData->addStatValue(
+        kSlowClientEventsStat, 1, facebook::fb303::COUNT);
+    XLOGF(
+        WARNING,
+        "KvStore stream-{} of {} is slow: its queue held at least {} bytes at "
+        "every check for {}s, and the client pulled a message within the last "
+        "{}s. Filter: {}",
+        subscriber->id,
+        subscriber->client,
+        limits.slowClientBytes,
+        limits.slowClientDuration.count(),
+        Constants::kKvStoreStreamSlowClientProgressWindow.count(),
+        subscriber->filter.describe());
+  }
+  for (const auto& subscriber : left) {
+    XLOGF(
+        INFO,
+        "KvStore stream-{} of {} left the slow state: its queue fell below {} "
+        "bytes",
+        subscriber->id,
+        subscriber->client,
+        limits.slowClientBytes / 2);
+  }
 }
 
 void

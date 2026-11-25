@@ -470,6 +470,27 @@ class Constants {
    * only with enable_ctrl_thrift_server_limits.
    */
   static constexpr size_t kKvStoreStreamTotalMaxBytes{256 * 1024 * 1024};
+  /*
+   * Slow-client alert: a stream whose queue holds at least this many bytes
+   * (half of the per-stream limit) at every check for the duration, while
+   * its client still pulls messages, enters the slow state. It leaves the
+   * state when its queue falls below half of this. Queues normally drain fast
+   * and hold a small backlog. A client that pulls nothing reaches the Thrift
+   * credit timeout or the per-stream limit.
+   */
+  static constexpr size_t kKvStoreStreamSlowClientBytes{16 * 1024 * 1024};
+  static constexpr std::chrono::seconds kKvStoreStreamSlowClientDuration{300};
+  /*
+   * A client still pulls messages when a check saw it pull at least one
+   * since the previous check, within this window.
+   */
+  static constexpr std::chrono::seconds kKvStoreStreamSlowClientProgressWindow{
+      60};
+  /*
+   * How often the ctrl handler checks for slow clients and refreshes the
+   * KvStore stream gauges, on its event base.
+   */
+  static constexpr std::chrono::seconds kKvStoreStreamStatsInterval{10};
 
   /*
    *

@@ -5,8 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <openr/common/Util.h>
 #include <openr/kvstore/KvStorePublisher.h>
+
+#include <openr/common/Util.h>
 
 namespace openr {
 

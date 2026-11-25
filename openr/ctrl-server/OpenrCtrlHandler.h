@@ -13,6 +13,7 @@
 #include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
 #include <folly/coro/AsyncGenerator.h>
+#include <folly/io/async/AsyncTimeout.h>
 #include <openr/common/Types.h>
 #include <openr/config-store/PersistentStore.h>
 #include <openr/config/Config.h>
@@ -460,13 +461,17 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
 
   /*
    * Registers the subscriber, then dumps the KvStore. A key update that
-   * KvStore publishes after the dump arrives on the stream.
+   * KvStore publishes after the dump arrives on the stream. `client` names
+   * the subscriber in stream logs (describeRequestClient()); the Thrift
+   * entry points pass their request's.
    */
   folly::coro::Task<apache::thrift::ResponseAndServerStream<
       std::vector<thrift::Publication>,
       thrift::Publication>>
   co_subscribeAndDumpKvStore(
-      thrift::KeyDumpParams filter, std::set<std::string> selectAreas);
+      thrift::KeyDumpParams filter,
+      std::set<std::string> selectAreas,
+      std::string client = "unknown client");
 
   folly::coro::Task<apache::thrift::ResponseAndServerStream<
       thrift::Publication,
@@ -634,6 +639,24 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
     return kvStoreStreams_->overflowDrops();
   }
 
+  /*
+   * Fires the KvStore stream stats timer now, on the ctrl event base, and
+   * waits for the callback.
+   */
+  void runKvStoreStreamStatsTimeoutForTest();
+
+  // Whether the KvStore stream stats timer is scheduled. Asks the ctrl evb.
+  bool isKvStoreStreamStatsTimerScheduledForTest();
+
+  /*
+   * Peer address and peer CN of a request, for stream logs. Example:
+   * "[2401:db00::1]:41234 (pss.example)"; "unknown client" without a
+   * connection. The request context is thread-local to the request's thread:
+   * a coroutine handler reads it before its first suspension.
+   */
+  static std::string describeRequestClient(
+      const apache::thrift::Cpp2RequestContext* requestContext);
+
   inline size_t
   getNumPendingLongPollReqs() {
     return longPollReqs_->size();
@@ -690,9 +713,17 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   folly::coro::Task<apache::thrift::ResponseAndServerStream<
       thrift::Publication,
       thrift::Publication>>
-  co_subscribeAndDumpKvStoreHelper(thrift::KeyDumpParams filter);
+  co_subscribeAndDumpKvStoreHelper(
+      thrift::KeyDumpParams filter, std::string client);
 
   void processPublication(thrift::Publication&& pub);
+
+  /*
+   * The KvStore stream stats timer callback, on the ctrl event base: checks
+   * for slow clients, refreshes the stream gauges, and schedules the next
+   * check until stop().
+   */
+  void onKvStoreStreamStatsTimeout();
 
   // enable_ctrl_thrift_server_limits; false without a Config.
   bool isKvStoreStreamLimitsEnabled() const;
@@ -705,7 +736,8 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
    */
   KvStoreStreamHandle admitKvStoreStream(
       const thrift::KeyDumpParams& filter,
-      const std::set<std::string>& selectAreas);
+      const std::set<std::string>& selectAreas,
+      std::string client);
 
   /*
    * Stream of one subscriber on the Open/R-owned queue. The frame owns
@@ -755,7 +787,16 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
           .maxSnapshotsInFlight = Constants::kKvStoreStreamMaxSnapshotsInFlight,
           .maxSubscribers = Constants::kKvStoreStreamMaxSubscribers,
           .maxQueueBytes = Constants::kKvStoreStreamQueueMaxBytes,
-          .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes}};
+          .maxTotalBytes = Constants::kKvStoreStreamTotalMaxBytes,
+          .slowClientBytes = Constants::kKvStoreStreamSlowClientBytes,
+          .slowClientDuration = Constants::kKvStoreStreamSlowClientDuration}};
+  /*
+   * With enable_ctrl_thrift_server_limits, fires every
+   * Constants::kKvStoreStreamStatsInterval on the ctrl event base. Scheduled
+   * in the constructor, before the event base runs; then fired, rescheduled
+   * and cancelled (stop()) only on the event base.
+   */
+  std::unique_ptr<folly::AsyncTimeout> kvStoreStreamStatsTimer_;
 
   // Active Fib streaming publishers
   folly::Synchronized<folly::F14FastMap<

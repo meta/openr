@@ -6,7 +6,9 @@
  */
 
 #include <chrono>
+#include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <folly/CancellationToken.h>
@@ -20,6 +22,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <fb303/ServiceData.h>
+
 #include <openr/common/Constants.h>
 #include <openr/common/Util.h>
 #include <openr/ctrl-server/KvStoreStreamRegistry.h>
@@ -29,6 +33,7 @@ namespace openr {
 namespace {
 
 const std::string kArea{"area1"};
+const std::string kClient{"test-client"};
 
 thrift::Publication
 makePublication(const std::vector<std::string>& keys) {
@@ -66,14 +71,27 @@ keysOf(const thrift::Publication& pub) {
 }
 
 /*
- * Admission limits that no test reaches; memory limits of 1 MiB that a test
- * reaches only when it lowers them.
+ * Admission limits and a slow-client threshold that no test reaches; memory
+ * limits of 1 MiB that a test reaches only when it lowers them.
  */
 constexpr KvStoreStreamLimits kTestLimits{
     .maxSnapshotsInFlight = 100,
     .maxSubscribers = 100,
     .maxQueueBytes = 1024 * 1024,
-    .maxTotalBytes = 1024 * 1024};
+    .maxTotalBytes = 1024 * 1024,
+    .slowClientBytes = std::numeric_limits<size_t>::max(),
+    .slowClientDuration = std::chrono::seconds(300)};
+
+/*
+ * Any queued message reaches the slow-client threshold; only an empty queue
+ * falls below half of it.
+ */
+KvStoreStreamLimits
+slowClientLimits() {
+  auto limits = kTestLimits;
+  limits.slowClientBytes = 1;
+  return limits;
+}
 
 KvStoreStreamHandle
 add(KvStoreStreamRegistry& registry,
@@ -548,9 +566,9 @@ TEST(KvStoreStreamRegistryTest, FullGateReclaimsExpiredSnapshotSlots) {
   std::optional<KvStoreStreamHandle> stuck;
   std::optional<KvStoreStreamHandle> recent;
   {
-    auto first = registry->tryAdd(1, allKeysFilter(), limits, t0);
+    auto first = registry->tryAdd(1, allKeysFilter(), limits, kClient, t0);
     auto second = registry->tryAdd(
-        2, allKeysFilter(), limits, t0 + std::chrono::seconds(1));
+        2, allKeysFilter(), limits, kClient, t0 + std::chrono::seconds(1));
     ASSERT_TRUE(first.hasValue());
     ASSERT_TRUE(second.hasValue());
     stuck.emplace(std::move(*first));
@@ -559,7 +577,11 @@ TEST(KvStoreStreamRegistryTest, FullGateReclaimsExpiredSnapshotSlots) {
 
   // One second short of the timeout: nothing is reclaimed.
   auto early = registry->tryAdd(
-      3, allKeysFilter(), limits, t0 + timeout - std::chrono::seconds(1));
+      3,
+      allKeysFilter(),
+      limits,
+      kClient,
+      t0 + timeout - std::chrono::seconds(1));
   ASSERT_TRUE(early.hasError());
   EXPECT_EQ(
       KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT,
@@ -567,7 +589,8 @@ TEST(KvStoreStreamRegistryTest, FullGateReclaimsExpiredSnapshotSlots) {
   EXPECT_EQ(0, registry->snapshotSlotReclaims());
 
   // At the timeout, only the oldest slot is reclaimed.
-  auto admitted = registry->tryAdd(4, allKeysFilter(), limits, t0 + timeout);
+  auto admitted =
+      registry->tryAdd(4, allKeysFilter(), limits, kClient, t0 + timeout);
   ASSERT_TRUE(admitted.hasValue());
   EXPECT_EQ(1, registry->snapshotSlotReclaims());
   EXPECT_EQ(3, registry->size());
@@ -589,13 +612,14 @@ TEST(KvStoreStreamRegistryTest, GateBelowLimitReclaimsNothing) {
   const KvStoreStreamLimits limits{
       .maxSnapshotsInFlight = 2, .maxSubscribers = 16};
   const auto t0 = std::chrono::steady_clock::now();
-  auto old = registry->tryAdd(1, allKeysFilter(), limits, t0);
+  auto old = registry->tryAdd(1, allKeysFilter(), limits, kClient, t0);
   ASSERT_TRUE(old.hasValue());
 
   auto next = registry->tryAdd(
       2,
       allKeysFilter(),
       limits,
+      kClient,
       t0 + 10 * Constants::kKvStoreStreamSnapshotSlotTimeout);
   ASSERT_TRUE(next.hasValue());
   EXPECT_EQ(0, registry->snapshotSlotReclaims());
@@ -811,12 +835,12 @@ CO_TEST(KvStoreStreamRegistryTest, ClosedQueueLeavesRegistry) {
   std::optional<KvStoreStreamHandle> holding;
   std::optional<KvStoreStreamHandle> unmatched;
   {
-    auto first = registry->tryAdd(1, allKeysFilter(), limits, t0);
+    auto first = registry->tryAdd(1, allKeysFilter(), limits, kClient, t0);
     auto second = registry->tryAdd(
-        2, allKeysFilter(), limits, t0 + std::chrono::seconds(1));
+        2, allKeysFilter(), limits, kClient, t0 + std::chrono::seconds(1));
     // The gate is full: the third reclaims the first one's slot.
-    auto third =
-        registry->tryAdd(3, keysFilter({"none"}), limits, t0 + timeout);
+    auto third = registry->tryAdd(
+        3, keysFilter({"none"}), limits, kClient, t0 + timeout);
     CO_ASSERT_TRUE(first.hasValue());
     CO_ASSERT_TRUE(second.hasValue());
     CO_ASSERT_TRUE(third.hasValue());
@@ -884,6 +908,299 @@ CO_TEST(KvStoreStreamRegistryTest, SharedMessageChargesBudgetOnce) {
   EXPECT_EQ(messageBytes, registry->referencedBytes());
   co_await second.queue().pop();
   EXPECT_EQ(0, registry->referencedBytes());
+}
+
+/*
+ * Fans out `count` one-key publications, then makes the stream slow at
+ * `start` + limits.slowClientDuration: the check at `start` sees the backlog;
+ * the client pulls one message; the next check sees the pull.
+ */
+folly::coro::Task<void>
+makeSlow(
+    KvStoreStreamRegistry& registry,
+    KvStoreStreamHandle& handle,
+    const KvStoreStreamLimits& limits,
+    size_t count,
+    std::chrono::steady_clock::time_point start) {
+  for (size_t i = 0; i < count; ++i) {
+    registry.fanOut(makePublication({"key" + std::to_string(i)}), kTestLimits);
+  }
+  registry.evaluateSlowClients(limits, start);
+  co_await handle.queue().pop();
+  registry.evaluateSlowClients(limits, start + limits.slowClientDuration);
+}
+
+int64_t
+slowClientsGauge() {
+  return facebook::fb303::fbData->getCounter(
+      "subscribers.kvstore.slow_clients");
+}
+
+int64_t
+slowClientEventsStat() {
+  return facebook::fb303::fbData
+      ->getCounterIfExists("subscribers.kvstore.slow_client_events.count")
+      .value_or(0);
+}
+
+/*
+ * A queue at or above the threshold at every check for the duration, while
+ * its client pulls messages, enters the slow state once. The fb303 values
+ * follow.
+ */
+CO_TEST(KvStoreStreamRegistryTest, SlowClientAfterDurationWithReads) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makePublication({"key1"}), kTestLimits);
+  registry->fanOut(makePublication({"key2"}), kTestLimits);
+  const auto start = std::chrono::steady_clock::now();
+  const auto limits = slowClientLimits();
+  const auto eventsBefore = slowClientEventsStat();
+
+  registry->evaluateSlowClients(limits, start);
+  co_await handle.queue().pop();
+  registry->evaluateSlowClients(limits, start + std::chrono::seconds(299));
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, slowClientsGauge());
+
+  registry->evaluateSlowClients(limits, start + std::chrono::seconds(300));
+  registry->evaluateSlowClients(limits, start + std::chrono::seconds(400));
+  EXPECT_EQ(1, registry->slowClients());
+  EXPECT_EQ(1, registry->slowClientEvents());
+  EXPECT_EQ(1, slowClientsGauge());
+  EXPECT_EQ(eventsBefore + 1, slowClientEventsStat());
+}
+
+// A client that pulls nothing never enters the slow state.
+TEST(KvStoreStreamRegistryTest, StalledClientIsNotSlow) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makePublication({"key1"}), kTestLimits);
+  const auto start = std::chrono::steady_clock::now();
+
+  registry->evaluateSlowClients(slowClientLimits(), start);
+  registry->evaluateSlowClients(
+      slowClientLimits(), start + std::chrono::seconds(600));
+
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, registry->slowClientEvents());
+}
+
+/*
+ * A client that pulled once and then stopped is stalled, not slow: its last
+ * pull is older than the progress window. A later pull makes it slow.
+ */
+CO_TEST(KvStoreStreamRegistryTest, PulledOnceThenStalledIsNotSlow) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  for (const auto& key : {"key1", "key2", "key3"}) {
+    registry->fanOut(makePublication({key}), kTestLimits);
+  }
+  const auto start = std::chrono::steady_clock::now();
+  const auto limits = slowClientLimits();
+  const auto window = Constants::kKvStoreStreamSlowClientProgressWindow;
+
+  registry->evaluateSlowClients(limits, start);
+  co_await handle.queue().pop();
+  registry->evaluateSlowClients(limits, start + std::chrono::seconds(1));
+  registry->evaluateSlowClients(
+      limits, start + std::chrono::seconds(1) + window);
+  registry->evaluateSlowClients(
+      limits, start + limits.slowClientDuration + std::chrono::seconds(1));
+  EXPECT_EQ(0, registry->slowClients());
+
+  co_await handle.queue().pop();
+  registry->evaluateSlowClients(
+      limits, start + limits.slowClientDuration + std::chrono::seconds(10));
+  EXPECT_EQ(1, registry->slowClients());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+// A slow client leaves the slow state when its queue drains.
+CO_TEST(KvStoreStreamRegistryTest, DrainedClientLeavesSlowState) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto start = std::chrono::steady_clock::now();
+  const auto limits = slowClientLimits();
+  co_await makeSlow(*registry, handle, limits, 2, start);
+  CO_ASSERT_EQ(1, registry->slowClients());
+
+  co_await handle.queue().pop();
+  registry->evaluateSlowClients(
+      limits, start + limits.slowClientDuration + std::chrono::seconds(1));
+
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, slowClientsGauge());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+/*
+ * A slow stream stays slow until its queue falls below half of the
+ * threshold. Threshold: 3.5 messages; below half: under 1.75 messages.
+ */
+CO_TEST(KvStoreStreamRegistryTest, SlowStateEndsBelowHalfThreshold) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  registry->fanOut(makePublication({"key9"}), kTestLimits);
+  const auto messageBytes = handle.queue().queuedBytes();
+  co_await handle.queue().pop();
+  auto limits = kTestLimits;
+  limits.slowClientBytes = 3 * messageBytes + messageBytes / 2;
+  const auto start = std::chrono::steady_clock::now();
+  // 5 messages queued, then 4 after the pull: slow.
+  co_await makeSlow(*registry, handle, limits, 5, start);
+  CO_ASSERT_EQ(1, registry->slowClients());
+
+  auto now = start + limits.slowClientDuration;
+  // 3, then 2 messages: below the threshold, not below half of it.
+  for (int i = 0; i < 2; ++i) {
+    co_await handle.queue().pop();
+    now += std::chrono::seconds(10);
+    registry->evaluateSlowClients(limits, now);
+    EXPECT_EQ(1, registry->slowClients());
+  }
+
+  // 1 message: below half.
+  co_await handle.queue().pop();
+  registry->evaluateSlowClients(limits, now + std::chrono::seconds(10));
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+// A stream that left the slow state and falls behind again counts again.
+CO_TEST(KvStoreStreamRegistryTest, SlowClientReentryCountsSecondEvent) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = slowClientLimits();
+  const auto start = std::chrono::steady_clock::now();
+  co_await makeSlow(*registry, handle, limits, 2, start);
+  co_await handle.queue().pop();
+  const auto drained =
+      start + limits.slowClientDuration + std::chrono::seconds(10);
+  registry->evaluateSlowClients(limits, drained);
+  CO_ASSERT_EQ(0, registry->slowClients());
+
+  co_await makeSlow(*registry, handle, limits, 2, drained);
+
+  EXPECT_EQ(1, registry->slowClients());
+  EXPECT_EQ(2, registry->slowClientEvents());
+}
+
+// Removing a slow stream updates the count and the gauge at once.
+CO_TEST(KvStoreStreamRegistryTest, RemovingSlowStreamUpdatesGauge) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  std::optional<KvStoreStreamHandle> handle(add(*registry, 1, allKeysFilter()));
+  co_await makeSlow(
+      *registry,
+      *handle,
+      slowClientLimits(),
+      2,
+      std::chrono::steady_clock::now());
+  CO_ASSERT_EQ(1, registry->slowClients());
+  CO_ASSERT_EQ(1, slowClientsGauge());
+
+  handle.reset();
+
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, slowClientsGauge());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+// A slow stream that the per-stream limit closes leaves without recovering.
+CO_TEST(KvStoreStreamRegistryTest, OverflowWhileSlowEndsSlowState) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = slowClientLimits();
+  const auto start = std::chrono::steady_clock::now();
+  co_await makeSlow(*registry, handle, limits, 2, start);
+  CO_ASSERT_EQ(1, registry->slowClients());
+
+  auto tightLimits = limits;
+  tightLimits.maxQueueBytes = handle.queue().queuedBytes();
+  registry->fanOut(makePublication({"key2"}), tightLimits);
+  EXPECT_EQ(1, registry->overflowDrops());
+  EXPECT_EQ(0, registry->size());
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, slowClientsGauge());
+
+  registry->evaluateSlowClients(
+      limits, start + limits.slowClientDuration + std::chrono::seconds(10));
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+// A slow stream that the total budget closes leaves without recovering.
+CO_TEST(KvStoreStreamRegistryTest, BudgetDropWhileSlowEndsSlowState) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = slowClientLimits();
+  co_await makeSlow(
+      *registry, handle, limits, 3, std::chrono::steady_clock::now());
+  CO_ASSERT_EQ(1, registry->slowClients());
+
+  auto tightLimits = limits;
+  tightLimits.maxTotalBytes = 1;
+  registry->fanOut(makePublication({"key3"}), tightLimits);
+
+  EXPECT_EQ(1, registry->budgetDrops());
+  EXPECT_EQ(0, registry->size());
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, slowClientsGauge());
+}
+
+/*
+ * A queue that closeAll() closed stays registered until its stream ends; it
+ * is no longer slow, and it did not recover.
+ */
+CO_TEST(KvStoreStreamRegistryTest, ClosedQueueIsNotSlow) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  const auto limits = slowClientLimits();
+  const auto start = std::chrono::steady_clock::now();
+  co_await makeSlow(*registry, handle, limits, 2, start);
+  CO_ASSERT_EQ(1, registry->slowClients());
+
+  registry->closeAll(terminated());
+  registry->evaluateSlowClients(
+      limits, start + limits.slowClientDuration + std::chrono::seconds(10));
+
+  EXPECT_EQ(1, registry->size());
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(1, registry->slowClientEvents());
+}
+
+// limits.slowClientBytes == 0 disables detection.
+CO_TEST(KvStoreStreamRegistryTest, ZeroSlowClientBytesDisablesDetection) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto handle = add(*registry, 1, allKeysFilter());
+  auto limits = kTestLimits;
+  limits.slowClientBytes = 0;
+  co_await makeSlow(
+      *registry, handle, limits, 2, std::chrono::steady_clock::now());
+
+  EXPECT_EQ(0, registry->slowClients());
+  EXPECT_EQ(0, registry->slowClientEvents());
+}
+
+// A check refreshes the occupancy and queued-bytes gauges.
+TEST(KvStoreStreamRegistryTest, CheckRefreshesGauges) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  auto full = add(*registry, 1, allKeysFilter());
+  auto empty = add(*registry, 2, keysFilter({"none"}));
+  registry->fanOut(makePublication({"key1"}), kTestLimits);
+  auto limits = kTestLimits;
+  limits.maxQueueBytes = 4 * full.queue().queuedBytes();
+
+  registry->evaluateSlowClients(limits, std::chrono::steady_clock::now());
+
+  EXPECT_EQ(
+      25,
+      facebook::fb303::fbData->getCounter(
+          "subscribers.kvstore.queue_occupancy_pct_max"));
+  EXPECT_EQ(
+      registry->referencedBytes(),
+      facebook::fb303::fbData->getCounter("subscribers.kvstore.queued_bytes"));
+  EXPECT_EQ(0, slowClientsGauge());
 }
 
 } // namespace openr

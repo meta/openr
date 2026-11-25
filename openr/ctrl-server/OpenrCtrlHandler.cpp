@@ -171,6 +171,16 @@ OpenrCtrlHandler::OpenrCtrlHandler(
 
     workers_.push_back(std::move(taskFutureFib));
   }
+
+  if (isKvStoreStreamLimitsEnabled()) {
+    kvStoreStreamStatsTimer_ =
+        folly::AsyncTimeout::make(*ctrlEvb->getEvb(), [this]() noexcept {
+          onKvStoreStreamStatsTimeout();
+        });
+    // Safe off the event base thread: the event base does not run yet.
+    kvStoreStreamStatsTimer_->scheduleTimeout(
+        Constants::kKvStoreStreamStatsInterval);
+  }
 }
 
 OpenrCtrlHandler::~OpenrCtrlHandler() {
@@ -183,6 +193,15 @@ OpenrCtrlHandler::~OpenrCtrlHandler() {
 void
 OpenrCtrlHandler::stop() {
   stopping_ = true;
+  if (kvStoreStreamStatsTimer_) {
+    /*
+     * The timer belongs to the ctrl event base: cancel it there. Runs inline
+     * when the event base does not run (yet, or any more). The callback does
+     * not reschedule once stopping_ is set.
+     */
+    ctrlEvb_->getEvb()->runImmediatelyOrRunInEventBaseThreadAndWait(
+        [this]() { kvStoreStreamStatsTimer_->cancelTimeout(); });
+  }
   completePendingLongPollReqs();
   closeKvStorePublishers();
   if (isKvStoreStreamLimitsEnabled()) {
@@ -1290,7 +1309,10 @@ folly::coro::Task<apache::thrift::ResponseAndServerStream<
     thrift::Publication,
     thrift::Publication>>
 OpenrCtrlHandler::co_subscribeAndGetKvStore() {
-  co_return co_await co_subscribeAndDumpKvStoreHelper(thrift::KeyDumpParams());
+  // Before the first suspension, while the request context is this request's.
+  auto client = describeRequestClient(getRequestContext());
+  co_return co_await co_subscribeAndDumpKvStoreHelper(
+      thrift::KeyDumpParams(), std::move(client));
 }
 
 folly::coro::Task<apache::thrift::ResponseAndServerStream<
@@ -1298,7 +1320,10 @@ folly::coro::Task<apache::thrift::ResponseAndServerStream<
     thrift::Publication>>
 OpenrCtrlHandler::co_subscribeAndGetKvStoreFiltered(
     std::unique_ptr<thrift::KeyDumpParams> filter) {
-  co_return co_await co_subscribeAndDumpKvStoreHelper(std::move(*filter));
+  // Before the first suspension, while the request context is this request's.
+  auto client = describeRequestClient(getRequestContext());
+  co_return co_await co_subscribeAndDumpKvStoreHelper(
+      std::move(*filter), std::move(client));
 }
 
 folly::coro::Task<apache::thrift::ResponseAndServerStream<
@@ -1307,18 +1332,20 @@ folly::coro::Task<apache::thrift::ResponseAndServerStream<
 OpenrCtrlHandler::co_subscribeAndGetAreaKvStores(
     std::unique_ptr<thrift::KeyDumpParams> filter,
     std::unique_ptr<std::set<std::string>> selectAreas) {
+  // Before the first suspension, while the request context is this request's.
+  auto client = describeRequestClient(getRequestContext());
   co_return co_await co_subscribeAndDumpKvStore(
-      std::move(*filter), std::move(*selectAreas));
+      std::move(*filter), std::move(*selectAreas), std::move(client));
 }
 
 folly::coro::Task<apache::thrift::ResponseAndServerStream<
     thrift::Publication,
     thrift::Publication>>
 OpenrCtrlHandler::co_subscribeAndDumpKvStoreHelper(
-    thrift::KeyDumpParams filter) {
+    thrift::KeyDumpParams filter, std::string client) {
   std::set<std::string> selectAreas{*getSingleAreaOrThrow()};
   auto responseAndStream = co_await co_subscribeAndDumpKvStore(
-      std::move(filter), std::move(selectAreas));
+      std::move(filter), std::move(selectAreas), std::move(client));
   auto pub = responseAndStream.response.empty()
       ? thrift::Publication{}
       : std::move(responseAndStream.response.front());
@@ -1331,7 +1358,9 @@ folly::coro::Task<apache::thrift::ResponseAndServerStream<
     std::vector<thrift::Publication>,
     thrift::Publication>>
 OpenrCtrlHandler::co_subscribeAndDumpKvStore(
-    thrift::KeyDumpParams filter, std::set<std::string> selectAreas) {
+    thrift::KeyDumpParams filter,
+    std::set<std::string> selectAreas,
+    std::string client) {
   if (!kvStore_) {
     throw thrift::KvStoreError(kKvStoreNotInitializedError);
   }
@@ -1344,7 +1373,7 @@ OpenrCtrlHandler::co_subscribeAndDumpKvStore(
   std::optional<KvStoreStreamHandle> handle;
   std::optional<apache::thrift::ServerStream<thrift::Publication>> stream;
   if (isKvStoreStreamLimitsEnabled()) {
-    handle.emplace(admitKvStoreStream(filter, selectAreas));
+    handle.emplace(admitKvStoreStream(filter, selectAreas, std::move(client)));
   } else {
     stream.emplace(subscribeKvStoreFilter(
         std::make_unique<thrift::KeyDumpParams>(filter),
@@ -1386,11 +1415,15 @@ OpenrCtrlHandler::isKvStoreStreamLimitsEnabled() const {
 KvStoreStreamHandle
 OpenrCtrlHandler::admitKvStoreStream(
     const thrift::KeyDumpParams& filter,
-    const std::set<std::string>& selectAreas) {
+    const std::set<std::string>& selectAreas,
+    std::string client) {
   const auto clientToken = publisherToken_++;
   const auto limits = kvStoreStreamLimits_.copy();
   auto handle = kvStoreStreams_->tryAdd(
-      clientToken, KvStorePublicationFilter(selectAreas, filter), limits);
+      clientToken,
+      KvStorePublicationFilter(selectAreas, filter),
+      limits,
+      std::move(client));
   if (!handle) {
     const auto& rejection = handle.error();
     const bool snapshots =
@@ -1428,6 +1461,56 @@ OpenrCtrlHandler::admitKvStoreStream(
       clientToken,
       folly::join(", ", selectAreas));
   return std::move(*handle);
+}
+
+std::string
+OpenrCtrlHandler::describeRequestClient(
+    const apache::thrift::Cpp2RequestContext* requestContext) {
+  const auto* connContext =
+      requestContext ? requestContext->getConnectionContext() : nullptr;
+  if (!connContext) {
+    return "unknown client";
+  }
+  const auto* peerAddress = connContext->getPeerAddress();
+  auto peerCommonName = connContext->getPeerCommonName();
+  if (peerCommonName.empty()) {
+    peerCommonName = "no peer CN";
+  }
+  return fmt::format(
+      "{} ({})",
+      peerAddress && peerAddress->isInitialized() ? peerAddress->describe()
+                                                  : "unknown address",
+      peerCommonName);
+}
+
+void
+OpenrCtrlHandler::onKvStoreStreamStatsTimeout() {
+  kvStoreStreams_->evaluateSlowClients(
+      kvStoreStreamLimits_.copy(), std::chrono::steady_clock::now());
+  if (!stopping_) {
+    kvStoreStreamStatsTimer_->scheduleTimeout(
+        Constants::kKvStoreStreamStatsInterval);
+  }
+}
+
+void
+OpenrCtrlHandler::runKvStoreStreamStatsTimeoutForTest() {
+  XCHECK(kvStoreStreamStatsTimer_);
+  ctrlEvb_->getEvb()->runInEventBaseThreadAndWait([this]() {
+    // A timeout that fired is no longer scheduled.
+    kvStoreStreamStatsTimer_->cancelTimeout();
+    onKvStoreStreamStatsTimeout();
+  });
+}
+
+bool
+OpenrCtrlHandler::isKvStoreStreamStatsTimerScheduledForTest() {
+  bool scheduled{false};
+  ctrlEvb_->getEvb()->runImmediatelyOrRunInEventBaseThreadAndWait([&]() {
+    scheduled =
+        kvStoreStreamStatsTimer_ && kvStoreStreamStatsTimer_->isScheduled();
+  });
+  return scheduled;
 }
 
 folly::coro::AsyncGenerator<thrift::Publication&&>

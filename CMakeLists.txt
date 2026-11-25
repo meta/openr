@@ -813,6 +813,7 @@ if(BUILD_TESTS)
     LIBRARIES
       openr_kvstore_stream_registry
       openr_test_utils
+      fb303::fb303
     DESTINATION sbin/tests/openr/ctrl-server
   )
 

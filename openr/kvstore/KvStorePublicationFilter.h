@@ -61,6 +61,12 @@ class KvStorePublicationFilter {
    */
   bool sameKeyFilter(const KvStorePublicationFilter& other) const;
 
+  /*
+   * For logs; lists at most the first 10 keys. Example: "areas [spine] keys
+   * [prefix:] originators [] oper OR ignoreTtl true doNotPublishValue false"
+   */
+  std::string describe() const;
+
  private:
   static bool computeKeepsAllKeys(const thrift::KeyDumpParams& filter);
 
