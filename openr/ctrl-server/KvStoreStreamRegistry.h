@@ -22,6 +22,7 @@
 #include <folly/container/F14Map.h>
 #include <folly/coro/Task.h>
 #include <folly/fibers/Semaphore.h>
+#include <folly/synchronization/SaturatingSemaphore.h>
 
 #include <openr/ctrl-server/KvStoreStreamMergeBuffer.h>
 #include <openr/if/gen-cpp2/KvStore_types.h>
@@ -232,6 +233,8 @@ struct KvStoreStreamRejection {
     SNAPSHOTS_IN_FLIGHT,
     // The subscriber cap is reached.
     SUBSCRIBERS,
+    // closeAll() ran: the handler is stopping.
+    STOPPED,
   };
   Reason reason{Reason::SUBSCRIBERS};
   size_t snapshotsInFlight{0};
@@ -292,9 +295,8 @@ class KvStoreStreamRegistry
    * reclaims the slots admitted at least
    * Constants::kKvStoreStreamSnapshotSlotTimeout before `now`; their
    * subscribers stay registered. Returns the rejection and registers nothing
-   * otherwise. After closeAll(), registers nothing, takes no slot, and
-   * returns a handle whose queue is already closed with the closeAll()
-   * reason.
+   * otherwise. After closeAll(), returns the STOPPED rejection, so no stream
+   * starts after the handler stopped.
    */
   folly::Expected<KvStoreStreamHandle, KvStoreStreamRejection> tryAdd(
       int64_t id,
@@ -341,7 +343,23 @@ class KvStoreStreamRegistry
    */
   void closeAll(const folly::exception_wrapper& reason);
 
+  /*
+   * After closeAll(), waits up to `timeout` until every handle that tryAdd()
+   * returned is destroyed, which happens when its stream ends. True when none
+   * is left. Counts the streams whose queue a limit closed: they leave the
+   * registry at once, and their stream ends at Thrift's next pull. A stream
+   * that Thrift paused ends only when Thrift pulls it again or its connection
+   * closes.
+   */
+  bool waitForStreamsToEnd(std::chrono::milliseconds timeout);
+
   size_t size() const;
+
+  /*
+   * Handles that tryAdd() returned and that are not destroyed: the streams
+   * that have not ended, including those whose queue a limit closed.
+   */
+  size_t openStreams() const;
 
   size_t snapshotsInFlight() const;
 
@@ -398,6 +416,10 @@ class KvStoreStreamRegistry
   bool erase(State& state, int64_t id);
   // Sets the slow streams count and its gauge. Under the registry lock.
   void setSlowClients(State& state, size_t slowClients);
+  // Posts `streamsEnded_` once closeAll() ran and no handle is left.
+  void postIfStreamsEnded(const State& state);
+  // The handle destructor: removes the subscriber if registered, and its
+  // handle.
   void remove(int64_t id);
   // Removes the subscribers whose queues fanOut() closed.
   void removeClosed(const std::vector<int64_t>& ids);
@@ -417,9 +439,12 @@ class KvStoreStreamRegistry
     size_t slowClients{0};
     // Set by closeAll().
     folly::exception_wrapper closeReason;
+    // Handles that tryAdd() returned and that are not destroyed.
+    size_t openHandles{0};
   };
 
   folly::Synchronized<State> state_;
+  folly::SaturatingSemaphore</* MayBlock= */ true> streamsEnded_;
   std::atomic<int64_t> snapshotSlotReclaims_{0};
 
   /*

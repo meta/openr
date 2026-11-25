@@ -7,6 +7,8 @@
 
 #include "openr/common/MainUtil.h"
 
+#include <wangle/acceptor/Acceptor.h>
+
 namespace openr {
 
 bool
@@ -172,6 +174,33 @@ configureKvStoreStreamLimits(apache::thrift::ThriftServer& server) {
       Constants::kOpenrCtrlThriftEgressBackpressureThresholdBytes);
   server.setEgressBufferBackpressureThreshold(
       Constants::kKvStoreStreamSendQuotaBytes);
+}
+
+void
+dropThriftServerConnections(apache::thrift::ThriftServer& server) {
+  server.forEachWorker([](wangle::Acceptor* acceptor) {
+    acceptor->getEventBase()->runInEventBaseThreadAndWait(
+        [acceptor]() { acceptor->dropAllConnections(); });
+  });
+}
+
+void
+endKvStoreStreams(
+    OpenrCtrlHandler& handler,
+    const std::vector<apache::thrift::ThriftServer*>& servers) {
+  if (handler.waitForKvStoreStreamsToEnd(
+          Constants::kKvStoreStreamShutdownGracePeriod)) {
+    return;
+  }
+  XLOGF(
+      WARNING,
+      "[Exit] {} KvStore stream(s) still open {}ms after stop(): closing the "
+      "OpenrCtrl connections",
+      handler.getNumOpenKvStoreStreams(),
+      Constants::kKvStoreStreamShutdownGracePeriod.count());
+  for (auto* server : servers) {
+    dropThriftServerConnections(*server);
+  }
 }
 
 void

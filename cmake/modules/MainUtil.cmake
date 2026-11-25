@@ -30,6 +30,7 @@ macro(openr_add_main_util_library)
       thrift::rpc
       glog::glog
       Threads::Threads
+      wangle::wangle_acceptor
       wangle::wangle_ssl_ssl_context_config
   )
   add_library(OpenR::main_util ALIAS openr_main_util)

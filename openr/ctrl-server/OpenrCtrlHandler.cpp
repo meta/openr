@@ -33,6 +33,9 @@ constexpr auto kKvStoreNotInitializedError = "KvStore is not initialized";
 // At most one admission-reject warning per interval.
 constexpr int64_t kKvStoreStreamRejectLogIntervalMs{10'000};
 
+// KvStore stream subscriptions after stop() fail with this error.
+constexpr std::string_view kKvStoreStreamStoppedError{"publisher terminated"};
+
 std::unique_ptr<std::vector<thrift::UnicastRouteDetail>>
 toUnicastRouteDetails(
     const folly::F14FastMap<folly::CIDRNetwork, RibUnicastEntry>& routes) {
@@ -211,6 +214,13 @@ OpenrCtrlHandler::stop() {
   }
   closeFibPublishers();
   closeFibDetailSubscribers();
+}
+
+bool
+OpenrCtrlHandler::waitForKvStoreStreamsToEnd(
+    std::chrono::milliseconds timeout) {
+  return !isKvStoreStreamLimitsEnabled() ||
+      kvStoreStreams_->waitForStreamsToEnd(timeout);
 }
 
 void
@@ -1383,10 +1393,14 @@ OpenrCtrlHandler::co_subscribeAndDumpKvStore(
       std::move(filter), std::move(selectAreas));
   if (handle) {
     /*
-     * After stop(), the client gets the snapshot, and the stream ends with
-     * the stop() reason at its first pull.
+     * A subscription that stop() overtook during its dump gets no stream:
+     * Thrift would not pull it if its client grants no credit, and the open
+     * stream would keep the server from stopping.
      */
-    if (!stopping_ && handle->queue().isClosed()) {
+    if (stopping_) {
+      throw std::runtime_error(std::string(kKvStoreStreamStoppedError));
+    }
+    if (handle->queue().isClosed()) {
       facebook::fb303::fbData->addStatValue(
           "subscribers.kvstore.subscribe_rejects", 1, facebook::fb303::COUNT);
       facebook::fb303::fbData->addStatValue(
@@ -1426,6 +1440,9 @@ OpenrCtrlHandler::admitKvStoreStream(
       std::move(client));
   if (!handle) {
     const auto& rejection = handle.error();
+    if (rejection.reason == KvStoreStreamRejection::Reason::STOPPED) {
+      throw std::runtime_error(std::string(kKvStoreStreamStoppedError));
+    }
     const bool snapshots =
         rejection.reason == KvStoreStreamRejection::Reason::SNAPSHOTS_IN_FLIGHT;
     facebook::fb303::fbData->addStatValue(

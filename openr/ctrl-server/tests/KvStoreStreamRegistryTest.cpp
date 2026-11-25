@@ -422,27 +422,71 @@ CO_TEST(KvStoreStreamRegistryTest, CancellationEndsWaitingPop) {
 
 /*
  * A subscriber that arrives after closeAll(), as when a subscription races
- * with the handler stop, gets a handle even at the limits: it is not
- * registered, takes no snapshot slot, and its pop() ends with the closeAll()
- * reason.
+ * with the handler stop, gets the STOPPED rejection: no handle, no slot, and
+ * no open stream.
  */
-CO_TEST(KvStoreStreamRegistryTest, AddAfterCloseAllClosesQueue) {
+TEST(KvStoreStreamRegistryTest, AddAfterCloseAllRejects) {
   auto registry = std::make_shared<KvStoreStreamRegistry>();
   registry->closeAll(terminated());
 
-  auto handle = registry->tryAdd(
-      1, allKeysFilter(), {.maxSnapshotsInFlight = 0, .maxSubscribers = 0});
-  CO_ASSERT_TRUE(handle.hasValue());
-  registry->fanOut(makePublication({"key1"}), kTestLimits);
+  auto handle = registry->tryAdd(1, allKeysFilter(), kTestLimits);
 
+  ASSERT_TRUE(handle.hasError());
+  EXPECT_EQ(KvStoreStreamRejection::Reason::STOPPED, handle.error().reason);
   EXPECT_EQ(0, registry->size());
   EXPECT_EQ(0, registry->snapshotsInFlight());
-  EXPECT_EQ(0, handle->queue().queuedMessages());
-  auto result = co_await folly::coro::co_awaitTry(handle->queue().pop());
-  CO_ASSERT_TRUE(result.hasException<std::runtime_error>());
-  EXPECT_STREQ(
-      "publisher terminated",
-      result.exception().get_exception<std::runtime_error>()->what());
+  EXPECT_EQ(0, registry->openStreams());
+  EXPECT_TRUE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
+}
+
+/*
+ * waitForStreamsToEnd() returns true once closeAll() ran and every handle is
+ * destroyed. A handle still alive, as in the frame of a stream that Thrift
+ * paused, keeps it false.
+ */
+TEST(KvStoreStreamRegistryTest, WaitForStreamsToEndAfterCloseAll) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  std::optional<KvStoreStreamHandle> handle{add(*registry, 1, allKeysFilter())};
+  EXPECT_FALSE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
+
+  registry->closeAll(terminated());
+  EXPECT_FALSE(registry->waitForStreamsToEnd(std::chrono::milliseconds(10)));
+
+  handle.reset();
+  EXPECT_TRUE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
+}
+
+// Without streams, waitForStreamsToEnd() returns true right after closeAll().
+TEST(KvStoreStreamRegistryTest, WaitForStreamsToEndWithoutStreams) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  EXPECT_FALSE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
+
+  registry->closeAll(terminated());
+
+  EXPECT_TRUE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
+}
+
+/*
+ * A stream whose queue a limit closed leaves the registry at once, and still
+ * counts until its handle is destroyed.
+ */
+TEST(KvStoreStreamRegistryTest, WaitForStreamsToEndCountsClosedQueues) {
+  auto registry = std::make_shared<KvStoreStreamRegistry>();
+  std::optional<KvStoreStreamHandle> overflowed{
+      add(*registry, 1, allKeysFilter())};
+  auto limits = kTestLimits;
+  limits.maxQueueBytes = 1;
+  registry->fanOut(makePublication({"key1"}), limits);
+  registry->fanOut(makePublication({"key2"}), limits);
+  ASSERT_EQ(1, registry->overflowDrops());
+  ASSERT_EQ(0, registry->size());
+
+  registry->closeAll(terminated());
+  EXPECT_EQ(1, registry->openStreams());
+  EXPECT_FALSE(registry->waitForStreamsToEnd(std::chrono::milliseconds(10)));
+
+  overflowed.reset();
+  EXPECT_TRUE(registry->waitForStreamsToEnd(std::chrono::milliseconds(0)));
 }
 
 /*

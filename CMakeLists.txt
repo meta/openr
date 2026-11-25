@@ -783,6 +783,7 @@ if(BUILD_TESTS)
       openr/tests/mocks/NetlinkEventsInjector.cpp
     LIBRARIES
       openr_ctrl_handler
+      openr_main_util
       openr_persistent_store
       openr_kvstore_wrapper
       openr_decision

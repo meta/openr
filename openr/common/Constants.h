@@ -522,6 +522,15 @@ class Constants {
    * KvStore stream gauges, on its event base.
    */
   static constexpr std::chrono::seconds kKvStoreStreamStatsInterval{10};
+  /*
+   * At shutdown, how long Open/R waits after OpenrCtrlHandler::stop() for the
+   * KvStore streams to end. Then it closes the OpenrCtrl connections that
+   * still carry a stream: Thrift does not pull a paused stream (send quota,
+   * no client credit) again, and ThriftServer::stop() aborts when a
+   * connection stays open past workers_join_timeout (4 s by default).
+   */
+  static constexpr std::chrono::milliseconds kKvStoreStreamShutdownGracePeriod{
+      std::chrono::seconds(1)};
 
   /*
    *

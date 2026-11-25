@@ -17,13 +17,17 @@
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/Timeout.h>
 #include <folly/init/Init.h>
+#include <folly/io/async/AsyncSocket.h>
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/synchronization/Baton.h>
 #include <thrift/lib/cpp2/TrustedServerException.h>
+#include <thrift/lib/cpp2/async/RocketClientChannel.h>
 #include <thrift/lib/cpp2/async/RpcOptions.h>
 #include <thrift/lib/cpp2/server/Cpp2ConnContext.h>
 #include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include <openr/common/Constants.h>
+#include <openr/common/MainUtil.h>
 #include <openr/common/Types.h>
 #include <openr/common/Util.h>
 #include <openr/config-store/PersistentStore.h>
@@ -3298,25 +3302,61 @@ CO_TEST_F(
 }
 
 /*
- * A subscription that arrives after stop() still gets its snapshot; its
- * stream ends at once with "publisher terminated" and registers nothing.
+ * A subscription that arrives after stop() fails with "publisher terminated"
+ * and opens no stream.
  */
-CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAfterStopEndsQueueStream) {
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, SubscribeAfterStopFails) {
   handler_->stop();
 
-  auto responseAndStream =
-      co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
-          thrift::KeyDumpParams{}, kSpineOnlySet);
-  EXPECT_EQ(1, responseAndStream.response.size());
-  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
-  auto gen = std::move(responseAndStream.stream).toAsyncGenerator();
+  auto result = co_await folly::coro::co_awaitTry(
+      getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+          thrift::KeyDumpParams{}, kSpineOnlySet));
 
-  auto next = co_await folly::coro::co_awaitTry(
-      folly::coro::timeout(gen.next(), kKvStorePublicationTimeout));
-  CO_ASSERT_TRUE(next.hasException());
+  CO_ASSERT_TRUE(result.hasException());
   EXPECT_THAT(
-      next.exception().what().toStdString(),
+      result.exception().what().toStdString(),
       testing::HasSubstr("publisher terminated"));
+  EXPECT_EQ(0, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(0, handler_->getNumOpenKvStoreStreams());
+  EXPECT_TRUE(
+      handler_->waitForKvStoreStreamsToEnd(std::chrono::milliseconds(0)));
+}
+
+/*
+ * A subscription admitted before stop() whose dump finishes after stop()
+ * fails with "publisher terminated" and opens no stream: its client might
+ * grant no credit, and the open stream would keep the server from stopping.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, StopDuringDumpFailsSubscription) {
+  folly::Baton<> kvStoreEvbHeld;
+  folly::Baton<> releaseKvStoreEvb;
+  kvStoreWrapper_->getKvStore()->runInEventBaseThread([&]() {
+    kvStoreEvbHeld.post();
+    releaseKvStoreEvb.wait();
+  });
+  kvStoreEvbHeld.wait();
+  auto* executor = co_await folly::coro::co_current_executor;
+  // The inline start returns at the dump on the held event base.
+  auto responseFuture =
+      co_withExecutor(
+          folly::getKeepAliveToken(executor),
+          handler_->co_subscribeAndDumpKvStore({}, kSpineOnlySet))
+          .startInlineUnsafe();
+  const auto openBeforeStop = handler_->getNumOpenKvStoreStreams();
+
+  handler_->stop();
+  releaseKvStoreEvb.post();
+  auto result = co_await folly::coro::co_awaitTry(
+      folly::coro::toTask(std::move(responseFuture)));
+
+  EXPECT_EQ(1, openBeforeStop);
+  CO_ASSERT_TRUE(result.hasException<std::runtime_error>());
+  EXPECT_THAT(
+      result.exception().what().toStdString(),
+      testing::HasSubstr("publisher terminated"));
+  EXPECT_EQ(0, handler_->getNumOpenKvStoreStreams());
+  EXPECT_TRUE(
+      handler_->waitForKvStoreStreamsToEnd(std::chrono::milliseconds(0)));
 }
 
 /*
@@ -3333,6 +3373,96 @@ CO_TEST_F(OpenrCtrlFixture, SubscribeAndGetKvStoreRequiresSingleArea) {
       apache::thrift::TApplicationException);
 
   EXPECT_EQ(0, handler_->getNumKvStorePublishers());
+}
+
+/*
+ * A stream that Thrift stopped pulling stays open after stop(). Its client
+ * reads nothing, so the writes fill the socket, pass the send quota, and
+ * Thrift pauses the stream; its queue then overflows and leaves the registry
+ * while the stream stays open. endKvStoreStreams() closes the connection,
+ * which ends the stream, and the server then stops at once. A second
+ * subscriber sees only a last small key: when it arrives, the fan-out has
+ * handled every earlier publication.
+ */
+CO_TEST_F(OpenrCtrlStreamLimitsFixture, EndKvStoreStreamsEndsPausedStream) {
+  constexpr size_t kValueBytes{1024 * 1024};
+  // More than the socket buffers and the 32 MiB per-stream limit take.
+  constexpr int kNumPublications{80};
+  auto server = std::make_unique<apache::thrift::ScopedServerInterfaceThread>(
+      handler_, "::1", 0, [](apache::thrift::ThriftServer& thriftServer) {
+        thriftServer.setEgressBufferBackpressureThreshold(
+            Constants::kKvStoreStreamSendQuotaBytes);
+      });
+  folly::ScopedEventBaseThread clientThread;
+  auto* clientEvb = clientThread.getEventBase();
+  std::unique_ptr<OpenrCtrlClient> client;
+  std::optional<apache::thrift::ResponseAndClientBufferedStream<
+      std::vector<thrift::Publication>,
+      thrift::Publication>>
+      subscription;
+  folly::Baton<> releaseClientEvb;
+  SCOPE_EXIT {
+    releaseClientEvb.post();
+    clientEvb->runInEventBaseThreadAndWait([&]() {
+      subscription.reset();
+      client.reset();
+    });
+  };
+  clientEvb->runInEventBaseThreadAndWait([&]() {
+    client = std::make_unique<OpenrCtrlClient>(
+        apache::thrift::RocketClientChannel::newChannel(
+            folly::AsyncSocket::newSocket(clientEvb, server->getAddress())));
+  });
+  subscription.emplace(
+      co_await co_withExecutor(
+          folly::getKeepAliveToken(clientEvb),
+          client->co_subscribeAndGetAreaKvStores(
+              thrift::KeyDumpParams{}, kSpineOnlySet)));
+  const std::string lastKey{"zz-last"};
+  thrift::KeyDumpParams lastKeyFilter;
+  lastKeyFilter.keys() = {lastKey};
+  auto lastKeyGen =
+      (co_await getOpenrCtrlClient().co_subscribeAndGetAreaKvStores(
+           lastKeyFilter, kSpineOnlySet))
+          .stream.toAsyncGenerator();
+
+  // The client stops reading: its event base waits.
+  folly::Baton<> clientEvbHeld;
+  clientEvb->runInEventBaseThread([&]() {
+    clientEvbHeld.post();
+    releaseClientEvb.wait();
+  });
+  clientEvbHeld.wait();
+  const auto value =
+      createThriftValue(1, "node1", std::string(kValueBytes, 'v'));
+  for (int i = 0; i < kNumPublications; ++i) {
+    kvStoreWrapper_->pushToKvStoreUpdatesQueue(
+        kSpineAreaId, {{fmt::format("key{}", i), value}});
+  }
+  kvStoreWrapper_->pushToKvStoreUpdatesQueue(
+      kSpineAreaId,
+      {{lastKey, createThriftValue(1, "node1", std::string("last"))}});
+  auto lastPub = co_await folly::coro::timeout(
+      lastKeyGen.next(), kKvStorePublicationTimeout);
+  CO_ASSERT_TRUE(lastPub.has_value());
+  CO_ASSERT_EQ(1, lastPub->keyVals()->count(lastKey));
+  // Thrift stopped pulling: the queue grew to the per-stream limit.
+  CO_ASSERT_EQ(1, handler_->getNumKvStoreStreamOverflowDrops());
+  EXPECT_EQ(1, handler_->getNumKvStoreStreams());
+  EXPECT_EQ(2, handler_->getNumOpenKvStoreStreams());
+
+  handler_->stop();
+  EXPECT_FALSE(
+      handler_->waitForKvStoreStreamsToEnd(std::chrono::milliseconds(200)));
+
+  endKvStoreStreams(*handler_, {&server->getThriftServer()});
+
+  EXPECT_TRUE(handler_->waitForKvStoreStreamsToEnd(std::chrono::seconds(5)));
+  EXPECT_EQ(0, handler_->getNumOpenKvStoreStreams());
+  const auto stopStart = std::chrono::steady_clock::now();
+  server.reset();
+  EXPECT_LT(
+      std::chrono::steady_clock::now() - stopStart, std::chrono::seconds(4));
 }
 
 int

@@ -655,6 +655,7 @@ main(int argc, char** argv) {
    * if it cannot drain them within workers_join_timeout.
    */
   ctrlHandler->stop();
+  endKvStoreStreams(*ctrlHandler, {server.get()});
   // Stop & destroy control thrift server. Will reduce ref-count on ctrlHandler
   server->stop();
   serverThread.join();

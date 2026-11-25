@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <folly/logging/xlog.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 
@@ -121,6 +123,23 @@ void configureKvStoreStreamLimits(apache::thrift::ThriftServer& server);
  */
 void configureCtrlThriftServer(
     const Config& config, apache::thrift::ThriftServer& server);
+
+/*
+ * Closes every connection of `server` at once, on its IO threads. Call from a
+ * thread that is not one of them.
+ */
+void dropThriftServerConnections(apache::thrift::ThriftServer& server);
+
+/*
+ * Call after `handler.stop()` and before the OpenrCtrl `servers` stop. Waits
+ * Constants::kKvStoreStreamShutdownGracePeriod for the KvStore streams to end.
+ * Then, if a stream is still open, closes the connections of `servers`:
+ * Thrift does not pull a stream it paused again, and the open connection would
+ * keep ThriftServer::stop() waiting past workers_join_timeout.
+ */
+void endKvStoreStreams(
+    OpenrCtrlHandler& handler,
+    const std::vector<apache::thrift::ThriftServer*>& servers);
 
 void waitTillStart(std::shared_ptr<apache::thrift::ThriftServer> server);
 

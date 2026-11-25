@@ -356,14 +356,14 @@ KvStoreStreamRegistry::tryAdd(
     std::chrono::steady_clock::time_point now) {
   auto subscriber = std::make_shared<KvStoreStreamSubscriber>(
       id, std::move(filter), std::move(client), referencedBytes_);
-  enum class Admission { ADMITTED, CLOSED, REJECTED };
+  enum class Admission { ADMITTED, REJECTED };
   KvStoreStreamRejection rejection;
   std::vector<int64_t> reclaimed;
   const auto admission = state_.withWLock([&](auto& state) {
     if (state.closeReason) {
-      // The handler stopped: the dispatcher no longer feeds the registry.
-      subscriber->queue.close(state.closeReason);
-      return Admission::CLOSED;
+      rejection.reason = KvStoreStreamRejection::Reason::STOPPED;
+      rejection.subscribers = state.subscribers.size();
+      return Admission::REJECTED;
     }
     if (state.snapshotsInFlight >= limits.maxSnapshotsInFlight) {
       /*
@@ -391,6 +391,7 @@ KvStoreStreamRegistry::tryAdd(
       return Admission::REJECTED;
     }
     ++state.snapshotsInFlight;
+    ++state.openHandles;
     subscriber->admissionTime = now;
     state.subscribers.emplace(id, subscriber);
     facebook::fb303::fbData->setCounter(
@@ -411,11 +412,7 @@ KvStoreStreamRegistry::tryAdd(
   if (admission == Admission::REJECTED) {
     return folly::makeUnexpected(rejection);
   }
-  if (admission == Admission::CLOSED) {
-    XLOGF(INFO, "KvStore stream-{} closed at once: the handler stopped.", id);
-  } else {
-    XLOGF(INFO, "KvStore stream-{} started.", id);
-  }
+  XLOGF(INFO, "KvStore stream-{} started.", id);
   return KvStoreStreamHandle(weak_from_this(), std::move(subscriber));
 }
 
@@ -456,6 +453,13 @@ KvStoreStreamRegistry::erase(State& state, int64_t id) {
 }
 
 void
+KvStoreStreamRegistry::postIfStreamsEnded(const State& state) {
+  if (state.closeReason && state.openHandles == 0) {
+    streamsEnded_.post();
+  }
+}
+
+void
 KvStoreStreamRegistry::setSlowClients(State& state, size_t slowClients) {
   state.slowClients = slowClients;
   slowClients_ = slowClients;
@@ -464,7 +468,16 @@ KvStoreStreamRegistry::setSlowClients(State& state, size_t slowClients) {
 
 void
 KvStoreStreamRegistry::remove(int64_t id) {
-  if (state_.withWLock([&](auto& state) { return erase(state, id); })) {
+  const bool registered = state_.withWLock([&](auto& state) {
+    const bool erased = erase(state, id);
+    XDCHECK_GT(state.openHandles, 0);
+    if (state.openHandles > 0) {
+      --state.openHandles;
+    }
+    postIfStreamsEnded(state);
+    return erased;
+  });
+  if (registered) {
     XLOGF(INFO, "KvStore stream-{} ended.", id);
   }
 }
@@ -729,14 +742,25 @@ KvStoreStreamRegistry::closeAll(const folly::exception_wrapper& reason) {
     for (const auto& [_, subscriber] : state.subscribers) {
       subscriber->queue.close(reason);
     }
-    numStreams = state.subscribers.size();
+    numStreams = state.openHandles;
+    postIfStreamsEnded(state);
   });
   XLOGF(INFO, "[Exit] Terminating {} active KvStore stream(s).", numStreams);
+}
+
+bool
+KvStoreStreamRegistry::waitForStreamsToEnd(std::chrono::milliseconds timeout) {
+  return streamsEnded_.try_wait_for(timeout);
 }
 
 size_t
 KvStoreStreamRegistry::size() const {
   return state_.rlock()->subscribers.size();
+}
+
+size_t
+KvStoreStreamRegistry::openStreams() const {
+  return state_.rlock()->openHandles;
 }
 
 size_t

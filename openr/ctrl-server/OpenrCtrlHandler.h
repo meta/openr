@@ -85,6 +85,14 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   void stop();
 
   /*
+   * After stop(), waits up to `timeout` for the KvStore queue streams to end.
+   * False when a stream is still open: Thrift does not pull a stream it paused
+   * (send quota, no client credit) again, so only closing its connection ends
+   * it (endKvStoreStreams() in MainUtil).
+   */
+  bool waitForKvStoreStreamsToEnd(std::chrono::milliseconds timeout);
+
+  /*
    *
    * fb303 service APIs
    *
@@ -625,6 +633,12 @@ class OpenrCtrlHandler final : public thrift::OpenrCtrlCppSvIf,
   inline size_t
   getNumKvStoreSnapshotsInFlight() {
     return kvStoreStreams_->snapshotsInFlight();
+  }
+
+  // KvStore queue streams that have not ended, registered or not.
+  inline size_t
+  getNumOpenKvStoreStreams() {
+    return kvStoreStreams_->openStreams();
   }
 
   // Thread-safe; applies to later subscriptions and publications.
