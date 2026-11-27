@@ -5,10 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import contextlib
+import io
 import time
 import unittest
 
-from openr.py.openr.cli.utils.utils import find_adj_list_deltas, parse_prefix_database
+from openr.py.openr.cli.utils.utils import (
+    find_adj_list_deltas,
+    parse_prefix_database,
+    print_adjs_table,
+)
 from openr.py.openr.utils import ipnetwork
 from openr.py.openr.utils.serializer import object_to_dict
 from openr.thrift.Network import thrift_types as network_types
@@ -126,3 +132,40 @@ class UtilsTests(unittest.TestCase):
         data = {}
         parse_prefix_database("2.0.0.0/8", "bgp", data, prefix_db)
         self.assertEqual(data["node1"].prefixEntries, [bgp2])
+
+    def test_print_adjs_table_missing_metric(self) -> None:
+        # Regression test for the breeze KeyError: 'metric' crash: an
+        # adjacency dict parsed from an area-aware / deserialized DB may
+        # not carry a top-level "metric" key. print_adjs_table must render
+        # "N/A" for the metric instead of raising KeyError.
+        adj_without_metric = {
+            "otherNodeName": "nodeA",
+            "ifName": "ifaceX",
+            "otherIfName": "ifaceY",
+            "isOverloaded": False,
+            "nextHopV4": "0.0.0.0",
+            "nextHopV6": "fe80::1",
+            "timestamp": 0,
+            "area": "1",
+        }
+        adjs_map = {
+            "node1": {
+                "is_overloaded": False,
+                "node_metric_increment_val": "0",
+                "adjacencies": [adj_without_metric],
+            }
+        }
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_adjs_table(adjs_map)
+        rendered = out.getvalue()
+        self.assertIn("nodeA", rendered)
+        self.assertIn("N/A", rendered)
+
+        # An adjacency that does carry a metric still shows it.
+        adj_with_metric = dict(adj_without_metric, metric=42)
+        adjs_map["node1"]["adjacencies"] = [adj_with_metric]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_adjs_table(adjs_map)
+        self.assertIn("42", out.getvalue())

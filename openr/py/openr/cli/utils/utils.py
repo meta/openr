@@ -663,11 +663,17 @@ def print_adjs_table(adjs_map, neigh=None, interface=None) -> None:
                     continue
 
             overload_status = click.style("Overloaded", fg="red")
-            metric = (
-                (overload_status if is_color_output_supported() else "OVERLOADED")
-                if adj["isOverloaded"]
-                else adj["metric"]
-            )
+            if adj["isOverloaded"]:
+                metric = (
+                    overload_status if is_color_output_supported() else "OVERLOADED"
+                )
+            elif "metric" in adj.keys() and adj["metric"] is not None:
+                metric = adj["metric"]
+            else:
+                # Adjacencies parsed from area-aware / deserialized DBs may
+                # not carry a top-level metric (see the "area" guard below);
+                # show N/A instead of crashing with KeyError: 'metric'.
+                metric = "N/A"
             uptime = time_since(adj["timestamp"]) if adj["timestamp"] else ""
             area = (
                 adj["area"]
